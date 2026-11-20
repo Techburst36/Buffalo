@@ -72,7 +72,8 @@ public:
               int n_slots,
               bool on_demand,
               std::string & err,
-              IoBackend io_backend = IoBackend::Auto);
+              IoBackend io_backend = IoBackend::Auto,
+              const HttpProviderOptions & http_opt = {});
 
     // `on_demand` (init): the expert slots are not held for the session. acquire() builds them
     // before a device graph and release() gives them back after the last one, so between prefills

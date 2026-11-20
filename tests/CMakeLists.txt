@@ -167,6 +167,18 @@ target_link_libraries(bmoe_block_provider_test PRIVATE bmoe_core)
 target_include_directories(bmoe_block_provider_test PRIVATE ${CMAKE_SOURCE_DIR}/core/src/io)
 add_test(NAME block_provider COMMAND bmoe_block_provider_test)
 
+# HttpRangeProvider + zero-disk remote http:// GGUF boot & streaming byte-identity (single & 4-shard split).
+add_executable(bmoe_http_range_test http_range_test.cpp)
+target_link_libraries(bmoe_http_range_test PRIVATE bmoe_core vendor::cpp-httplib)
+if(WIN32)
+    target_link_libraries(bmoe_http_range_test PRIVATE ws2_32)
+endif()
+target_include_directories(bmoe_http_range_test PRIVATE
+    ${CMAKE_SOURCE_DIR}/core/src/io
+    ${CMAKE_SOURCE_DIR}/core/src/moe)
+target_include_directories(bmoe_http_range_test SYSTEM PRIVATE
+    ${CMAKE_SOURCE_DIR}/third_party/llama.cpp/vendor)
+
 # self_path: the executable's own file with every link resolved, so a link on PATH (what install.sh
 # puts there) still finds the backend modules beside the real file (#605). Starts itself again
 # through a link; no model.
@@ -317,6 +329,13 @@ if(PYTHON3)
     add_test(NAME moe_gates_split
              COMMAND bmoe_moe_gates "${CMAKE_CURRENT_BINARY_DIR}/tiny-moe-split-00001-of-00004.gguf" ${_gate_args})
     set_tests_properties(moe_gates_split PROPERTIES FIXTURES_REQUIRED TINY_MOE_MODEL_split)
+
+    add_test(NAME http_range
+             COMMAND bmoe_http_range_test
+                     "${CMAKE_CURRENT_BINARY_DIR}/tiny-moe-qwen3moe.gguf"
+                     "${CMAKE_CURRENT_BINARY_DIR}/tiny-moe-split-00001-of-00004.gguf")
+    set_tests_properties(http_range PROPERTIES
+                         FIXTURES_REQUIRED "TINY_MOE_MODEL_qwen3moe;TINY_MOE_MODEL_split")
 else()
     message(WARNING "python3 not found: MoE gates will not run (models cannot be generated)")
 endif()

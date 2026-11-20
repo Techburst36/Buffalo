@@ -13,6 +13,7 @@
 #include "bmoe/probe.h"
 
 #include "../engine/kv_cache_type.h"
+#include "../io/block_provider.h"
 #include "../moe/tensor_names.h"
 
 #include "fit.h"
@@ -57,6 +58,10 @@ Placement probe_placement(const char * model_path,
                           const SpecConfig * spec) {
     Placement pl;
     if (!model_path || !*model_path || !model.ok) return pl;
+    if (is_remote_url(model_path)) {
+        pl.outcome = "the capacity fitter was skipped for a remote HTTP model";
+        return pl;
+    }
 
     // The fitter works by asking every device it is handed, and a device that did not survive its own
     // probe is not one to ask again from this process: what ended the probe would end the plan. So it

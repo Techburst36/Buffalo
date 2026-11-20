@@ -60,7 +60,8 @@ public:
     bool init(std::vector<DenseTensorRef> tensors,
               const std::vector<std::string> & paths,
               uint64_t budget_bytes,
-              IoBackend io_backend = IoBackend::Auto);
+              IoBackend io_backend = IoBackend::Auto,
+              const HttpProviderOptions & http_opt = {});
 
     bool empty() const { return tables_.empty(); }
 

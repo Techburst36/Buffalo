@@ -68,12 +68,14 @@ public:
 
     // Build buffers, rebind the bound layers' expert tensors onto them, and start the
     // I/O pool. `layers` is indexed by layer id (unbound entries are skipped); each tensor's
-    // file_idx indexes `shard_paths` (a single-file model passes one path). Returns false on
-    // any allocation/open failure or an inconsistent tensor.
+    // file_idx indexes `shard_paths` (a single-file model passes one path). An optional
+    // `preopened_provider` (e.g. an HttpRangeProvider already opened during remote boot) is
+    // adopted directly to preserve keep-alive connections and spill-cache state.
     bool init(const std::vector<std::string> & shard_paths,
               int n_expert,
               std::vector<LayerExperts> layers,
-              const MoeStreamConfig & cfg);
+              const MoeStreamConfig & cfg,
+              std::unique_ptr<BlockProvider> preopened_provider = nullptr);
 
     // Supply the dense (non-expert) weight tensors the DenseWeights policy may need (only the
     // Anonymous mode reads+rebinds them). Call BEFORE init, which hands them to the dense module.

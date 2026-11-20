@@ -13,6 +13,7 @@
 
 #include "bmoe/probe.h"
 
+#include "../io/block_provider.h"
 #include "../io/platform_io.h"
 #include "../moe/gguf_offsets.h"
 #include "../moe/tensor_names.h"
@@ -250,15 +251,13 @@ ModelProfile probe_model(const char * model_path) {
 }
 
 std::string model_fingerprint(const char * model_path) {
+    if (!model_path || !*model_path) return "";
     // Where the samples are taken, as fractions of the file: the start carries the header and the
     // metadata, the rest the tensor bytes that tell two models of one shape apart.
     constexpr uint64_t k_head_bytes = 1ull << 20;
     constexpr uint64_t k_window_bytes = 64ull << 10;
     constexpr int k_windows = 4;
 
-    const pio::fd_t fd = pio::open_read(model_path, false);
-    if (!pio::fd_ok(fd)) return "";
-    const uint64_t size = pio::file_size(fd);
     uint64_t h = 1469598103934665603ull; // FNV-1a, 64-bit
     auto mix = [&h](const unsigned char * p, size_t n) {
         for (size_t i = 0; i < n; ++i) {
@@ -266,6 +265,40 @@ std::string model_fingerprint(const char * model_path) {
             h *= 1099511628211ull;
         }
     };
+
+    if (is_remote_url(model_path)) {
+        HttpProviderOptions opt;
+        opt.lanes = 1;
+        auto prov = open_block_provider({model_path}, 1, false, k_head_bytes, IoBackend::Auto, opt);
+        if (!prov) return "";
+        const uint64_t size = prov->shard_size(0);
+        unsigned char size_le[8];
+        for (int i = 0; i < 8; ++i)
+            size_le[i] = (unsigned char) (size >> (8 * i));
+        mix(size_le, sizeof(size_le));
+        std::vector<unsigned char> buf(k_head_bytes);
+        bool ok = size > 0;
+        auto sample = [&](uint64_t off, uint64_t len) {
+            if (!ok || off >= size) return;
+            len = std::min(len, size - off);
+            if (prov->read(0, 0, buf.data(), off, len) != (long long) len) {
+                ok = false;
+                return;
+            }
+            mix(buf.data(), (size_t) len);
+        };
+        sample(0, k_head_bytes);
+        for (int i = 1; i <= k_windows; ++i)
+            sample(size > k_window_bytes ? (size - k_window_bytes) / k_windows * i : 0, k_window_bytes);
+        if (!ok) return "";
+        char hex[17];
+        std::snprintf(hex, sizeof(hex), "%016llx", (unsigned long long) h);
+        return hex;
+    }
+
+    const pio::fd_t fd = pio::open_read(model_path, false);
+    if (!pio::fd_ok(fd)) return "";
+    const uint64_t size = pio::file_size(fd);
     unsigned char size_le[8];
     for (int i = 0; i < 8; ++i)
         size_le[i] = (unsigned char) (size >> (8 * i));

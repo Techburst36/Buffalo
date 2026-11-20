@@ -111,6 +111,23 @@ private:
     size_t buffer_align_ = 4096;
 };
 
+// Options specific to remote HTTP Range streaming.
+// When cache_dir is empty or cache_bytes == 0, HttpRangeProvider operates in strict 0-disk mode.
+struct HttpProviderOptions {
+    std::string cache_dir;
+    uint64_t cache_bytes = 0;
+    int lanes = 0; // 0 = use caller's lane count (or default minimum for HTTP)
+};
+
+// URL scheme helpers for remote HTTP GGUF streaming.
+bool is_http_url(const std::string & path);
+bool is_https_url(const std::string & path);
+bool is_remote_url(const std::string & path);
+
+// Expand a split URL `<prefix>-00001-of-NNNNN.gguf[?query]` into all N shard URLs (preserving any
+// query string). Returns {url} for a non-split URL; returns empty vector if url names shard > 1.
+std::vector<std::string> expand_split_urls(const std::string & url);
+
 // Open a local-file BlockProvider honoring `pref` (auto | posix | io_uring).
 // When io_uring is compiled in and requested (auto or io_uring), attempts IoUringBlockProvider
 // first; if io_uring_setup fails due to kernel/sandbox policy (ENOSYS/EPERM/EACCES/ENOMEM), logs
@@ -120,5 +137,15 @@ std::unique_ptr<BlockProvider> open_local_block_provider(const std::vector<std::
                                                          bool direct,
                                                          size_t max_read,
                                                          IoBackend pref = IoBackend::Auto);
+
+// Open either a local BlockProvider or an HttpRangeProvider when `paths[0]` is a remote URL.
+// If `error` is non-null, writes an actionable diagnostic on failure.
+std::unique_ptr<BlockProvider> open_block_provider(const std::vector<std::string> & paths,
+                                                   int lanes,
+                                                   bool direct,
+                                                   size_t max_read,
+                                                   IoBackend pref = IoBackend::Auto,
+                                                   const HttpProviderOptions & http_opt = {},
+                                                   std::string * error = nullptr);
 
 } // namespace bmoe

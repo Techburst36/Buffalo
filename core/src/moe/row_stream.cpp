@@ -20,7 +20,8 @@ static uint64_t round_up(uint64_t v, uint64_t a) {
 bool RowStream::init(std::vector<DenseTensorRef> tensors,
                      const std::vector<std::string> & paths,
                      uint64_t budget_bytes,
-                     IoBackend io_backend) {
+                     IoBackend io_backend,
+                     const HttpProviderOptions & http_opt) {
     if (tensors.empty()) return true;
     page_ = pio::vm_page();
     slab_ = round_up(slab_min_bytes, page_);
@@ -32,7 +33,9 @@ bool RowStream::init(std::vector<DenseTensorRef> tensors,
     // Single-lane provider over all shards, sized for a slab window. Independent of both the expert
     // stream's provider and the dense loader's, for the same reason theirs are independent of each
     // other: the O_DIRECT decision belongs to the consumer, not to the file.
-    provider_ = open_local_block_provider(paths, 1, /*direct=*/true, (size_t) slab_, io_backend);
+    HttpProviderOptions row_http = http_opt;
+    row_http.lanes = 1;
+    provider_ = open_block_provider(paths, 1, /*direct=*/true, (size_t) slab_, io_backend, row_http);
     if (!provider_) {
         log_printf(LogLevel::Warn, "row-stream could not open model shard(s) — tables keep the dense policy");
         return false;

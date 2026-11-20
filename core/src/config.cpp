@@ -343,6 +343,13 @@ ValidationResult validate(const RunConfig & cfg) {
     if (cfg.moe.row_stream_mb < 0) {
         return fail("{row-stream-mb} cannot be negative (0 uses the built-in window)");
     }
+    if (cfg.moe.http_cache_mb < 0) {
+        return fail("{http-cache-mb} cannot be negative (0 disables the local disk spill cache)");
+    }
+    if (cfg.moe.http_threads < 0 || cfg.moe.http_threads > MoeStreamConfig::http_threads_max) {
+        return fail("{http-threads} must be between 0 and " + std::to_string(MoeStreamConfig::http_threads_max) +
+                    " (0 picks automatically)");
+    }
 
     if (cfg.moe.enabled) {
         const MoeStreamConfig & m = cfg.moe;

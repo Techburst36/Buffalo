@@ -99,7 +99,8 @@ bool DeviceExpertArena::init(ggml_backend_dev_t dev,
                              int n_slots,
                              bool on_demand,
                              std::string & err,
-                             IoBackend io_backend) {
+                             IoBackend io_backend,
+                             const HttpProviderOptions & http_opt) {
     if (!dev || threads < 1) {
         err = "no device or no loader thread";
         return false;
@@ -220,7 +221,7 @@ bool DeviceExpertArena::init(ggml_backend_dev_t dev,
     if (!on_demand_ && !build_slots(err)) return false;
 
     // Staging is filled by the provider over all shards, so it is aligned for the coarsest of them.
-    provider_ = open_local_block_provider(shard_paths, threads, direct, (size_t) max_nb2, io_backend);
+    provider_ = open_block_provider(shard_paths, threads, direct, (size_t) max_nb2, io_backend, http_opt);
     if (!provider_) {
         err = "cannot open model shard(s)";
         return false;

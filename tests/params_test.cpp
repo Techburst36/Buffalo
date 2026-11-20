@@ -232,6 +232,10 @@ int main() {
     expect_flag({"--io-backend", "posix"}, [](const RunConfig & c) { return c.moe.io_backend == IoBackend::Posix; });
     expect_flag({"--io-backend", "io_uring"},
                 [](const RunConfig & c) { return c.moe.io_backend == IoBackend::IoUring; });
+    expect_flag({"--http-cache-dir", "/tmp/bmoe-http"},
+                [](const RunConfig & c) { return c.moe.http_cache_dir == "/tmp/bmoe-http"; });
+    expect_flag({"--http-cache-mb", "256"}, [](const RunConfig & c) { return c.moe.http_cache_mb == 256; });
+    expect_flag({"--http-threads", "12"}, [](const RunConfig & c) { return c.moe.http_threads == 12; });
     expect_flag({"--load-all"}, [](const RunConfig & c) { return c.moe.load_all; });
     expect_flag({"--llama-debug"}, [](const RunConfig & c) { return c.llama_debug_log; });
     expect_flag({"--force-cache"}, [](const RunConfig & c) { return c.moe.force_cache; });

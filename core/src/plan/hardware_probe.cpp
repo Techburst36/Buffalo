@@ -3,6 +3,7 @@
 
 #include "bmoe/probe.h"
 
+#include "../io/block_provider.h"
 #include "../io/platform_io.h"
 #include "../engine/llama_log.h"
 #include "memory_topology.h"
@@ -382,14 +383,18 @@ HardwareProfile probe_hardware(const char * model_path) {
     probe_devices(h);
 
     if (model_path && *model_path) {
-        // Whether uncached reads are actually in effect is a property of this path, not of the
-        // platform: the same device answers yes on one filesystem and declines on another. Ask the
-        // open what it got rather than reconstructing it from what was requested.
-        bool effective = false;
-        pio::fd_t fd = pio::open_read(model_path, /*direct=*/true, &effective);
-        if (pio::fd_ok(fd)) {
-            h.storage.direct_ok = effective ? Tri::Yes : Tri::No;
-            pio::close_fd(fd);
+        if (is_remote_url(model_path)) {
+            h.storage.direct_ok = Tri::No;
+        } else {
+            // Whether uncached reads are actually in effect is a property of this path, not of the
+            // platform: the same device answers yes on one filesystem and declines on another. Ask the
+            // open what it got rather than reconstructing it from what was requested.
+            bool effective = false;
+            pio::fd_t fd = pio::open_read(model_path, /*direct=*/true, &effective);
+            if (pio::fd_ok(fd)) {
+                h.storage.direct_ok = effective ? Tri::Yes : Tri::No;
+                pio::close_fd(fd);
+            }
         }
     }
 

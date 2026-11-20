@@ -522,6 +522,41 @@ std::vector<ParamDesc> build() {
         t.push_back(d);
     }
     {
+        ParamDesc d = row("http-cache-dir", "HTTP disk spill cache directory", G::Streaming, L::Advanced,
+                          "Optional local directory for bounded disk caching of remote HTTP Range chunks. "
+                          "Empty (the default) or --http-cache-mb 0 keeps strict zero-disk mode.");
+        d.type = ParamType::Path;
+        d.value_hint = "DIR";
+        bind_string(d, [](RunConfig & c) -> std::string & { return c.moe.http_cache_dir; });
+        d.details = "Directory where remote HTTP weight chunks may spill when --http-cache-mb is above 0. "
+                    "Leave empty for zero local disk usage.";
+        t.push_back(d);
+    }
+    {
+        ParamDesc d = row("http-cache-mb", "HTTP disk spill cache", G::Streaming, L::Advanced,
+                          "Bounded local disk spill cache in MiB for remote http:// models. 0 (the default) disables "
+                          "disk caching for strict zero-disk streaming.");
+        d.value_hint = "N";
+        at_least(d, 0, "MiB");
+        special(d, "0", "off (zero-disk)");
+        bind_int(d, [](RunConfig & c) -> int & { return c.moe.http_cache_mb; });
+        d.details = "Maximum local disk space used to cache remote HTTP weight chunks in --http-cache-dir. "
+                    "0 keeps zero bytes on local disk.";
+        t.push_back(d);
+    }
+    {
+        ParamDesc d = row("http-threads", "HTTP read lanes", G::Streaming, L::Advanced,
+                          "Concurrent keep-alive HTTP Range lanes for remote http:// models. 0 picks automatically "
+                          "(at least 8 lanes).");
+        d.value_hint = "N";
+        bounds(d, 0, MoeStreamConfig::http_threads_max, "lanes");
+        special(d, "0", "auto");
+        bind_int(d, [](RunConfig & c) -> int & { return c.moe.http_threads; });
+        d.details = "Number of concurrent keep-alive HTTP Range connections used when streaming weights from a remote "
+                    "server. 0 chooses automatically.";
+        t.push_back(d);
+    }
+    {
         ParamDesc d = row("o-direct", "Direct I/O", G::Streaming, L::Advanced,
                           "Bypass the page cache for expert reads (O_DIRECT / FILE_FLAG_NO_BUFFERING).");
         d.type = ParamType::Bool;

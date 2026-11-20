@@ -116,6 +116,12 @@ struct MoeStreamConfig {
 
     IoBackend io_backend = IoBackend::Auto; // storage I/O provider: auto | posix | io_uring
     bool o_direct = true;                   // bypass the page cache (O_DIRECT / FILE_FLAG_NO_BUFFERING)
+
+    // Remote HTTP Range streaming options (used when model_path starts with http://).
+    // When http_cache_mb == 0 or http_cache_dir is empty, operates in strict 0-byte local disk mode.
+    std::string http_cache_dir;
+    int http_cache_mb = 0; // bounded local disk spill cache budget in MiB (0 = off / 0-disk)
+    int http_threads = 0;  // HTTP keep-alive concurrency lanes (0 = auto: max(io_threads, http_threads_default))
     bool load_all = false;    // debug/A-B: load ALL experts each token (full-sweep baseline)
     bool force_cache = false; // allow a cache_mb in the pathological band (tests/experiments)
 
@@ -414,6 +420,8 @@ struct MoeStreamConfig {
 
     static constexpr int cache_min_mb = 1500; // smallest non-pathological cache (see above)
     static constexpr int io_threads_max = 8;
+    static constexpr int http_threads_default = 8;
+    static constexpr int http_threads_max = 32;
     static constexpr int prefetch_layers_max = 8;
     static constexpr int cache_freq_half_life_max = 4096; // tokens; far beyond it is plain frequency
 

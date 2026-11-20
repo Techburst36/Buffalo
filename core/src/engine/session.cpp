@@ -22,6 +22,7 @@
 #include "../moe/expert_stream_source.h"
 #include "../moe/gguf_offsets.h"
 #include "../moe/tensor_names.h"
+#include "../moe/virtual_host_buft.h"
 #include "cache_brake.h"
 #include "context_checkpoints.h"
 #include "kv_cache_type.h"
@@ -30,6 +31,7 @@
 #include "knob_trial.h"
 #include "device_answer.h"
 #include "logit_agreement.h"
+#include "../io/block_provider.h"
 #include "../io/platform_io.h"
 #include "../io/mapping_release.h"
 #include "../io/parallel_copy.h"
@@ -56,6 +58,7 @@
 #include <exception>
 #include <map>
 #include <memory>
+#include <regex>
 #include <string>
 #include <unordered_set>
 #include <utility>
@@ -294,6 +297,44 @@ dense_bytes_per_layer(const GgufOffsets & offs, const std::vector<LayerExperts> 
 // Width of one prefill piece under a prefill device: one ubatch, so a decode call is one graph.
 int prefill_piece(const SessionConfig & cfg) {
     return cfg.n_ubatch > 0 ? std::min(cfg.n_ubatch, cfg.n_batch) : cfg.n_batch;
+}
+
+HttpProviderOptions http_options_from(const MoeStreamConfig & moe) {
+    HttpProviderOptions opt;
+    opt.cache_dir = moe.http_cache_dir;
+    opt.cache_bytes = (uint64_t) std::max(0, moe.http_cache_mb) << 20;
+    opt.lanes = moe.http_threads > 0 ? moe.http_threads
+                                     : std::max(moe.io_threads, MoeStreamConfig::http_threads_default);
+    return opt;
+}
+
+std::string regex_escape_literal(const std::string & s) {
+    std::string out;
+    out.reserve(s.size() * 2);
+    for (char c : s) {
+        switch (c) {
+        case '.':
+        case '^':
+        case '$':
+        case '|':
+        case '(':
+        case ')':
+        case '[':
+        case ']':
+        case '{':
+        case '}':
+        case '*':
+        case '+':
+        case '?':
+        case '\\':
+            out.push_back('\\');
+            break;
+        default:
+            break;
+        }
+        out.push_back(c);
+    }
+    return out;
 }
 
 } // namespace
@@ -985,9 +1026,27 @@ struct Session::Impl::Opening {
     // common path never needs. One parse serves both the model info and the offsets.
     GgufMeta gguf_meta{};
     bool gguf_meta_read = false;
+    RemoteGgufMeta remote{};
+    bool remote_read = false;
+    const RemoteGgufMeta & ensure_remote() {
+        if (!remote_read) {
+            const HttpProviderOptions http_opt = http_options_from(cfg.moe);
+            remote = read_remote_gguf_meta(cfg.model_path.c_str(), http_opt.lanes, http_opt);
+            remote_read = true;
+            if (remote.ok) {
+                gguf_meta = remote.meta;
+                gguf_meta_read = true;
+            }
+        }
+        return remote;
+    }
     const GgufMeta & meta() {
         if (!gguf_meta_read) {
-            gguf_meta = read_gguf_meta(cfg.model_path.c_str());
+            if (is_remote_url(cfg.model_path)) {
+                ensure_remote();
+            } else {
+                gguf_meta = read_gguf_meta(cfg.model_path.c_str());
+            }
             gguf_meta_read = true;
         }
         return gguf_meta;
@@ -1061,9 +1120,67 @@ bool Session::Impl::load_model(Opening & o, llama_model ** reference) {
     // charge: off for that case too.
     mparams.lazy_mode =
         cfg.moe.row_stream || !cfg.moe.dense_mapped.empty() ? LLAMA_LAZY_MODE_OFF : LLAMA_LAZY_MODE_AUTO;
+    const bool remote = is_remote_url(cfg.model_path);
+    std::vector<std::string> vhost_patterns;
     std::vector<llama_model_tensor_buft_override> buft_overrides;
-    if (!cfg.buft_overrides.empty()) {
-        buft_overrides.reserve(cfg.buft_overrides.size() + 1);
+
+    if (remote) {
+        const RemoteGgufMeta & rem = o.ensure_remote();
+        if (!rem.ok) return o.fail(rem.error.empty() ? ("cannot open remote GGUF: " + cfg.model_path) : rem.error);
+
+        // When streaming a remote MoE model, override routed expert tensors to our
+        // virtual-reservation host buffer type so llama_model_init_from_user() reserves
+        // address space with 0 physical RAM committed and fetches 0 routed expert bytes over HTTP.
+        if (cfg.moe.enabled) {
+            const ExpertLayout lay = discover_expert_layout(rem.meta.offsets.extents, rem.meta.info.n_expert);
+            if (!lay.ok)
+                return o.fail("not a MoE this engine streams: " + lay.error +
+                              ". Turn {moe-stream} off to run it resident (docs/which-models-stream.md).");
+
+            if (cfg.n_gpu_layers == 0 || cfg.buft_overrides.empty()) {
+                vhost_patterns.reserve((size_t) lay.n_slots);
+                for (int p = 0; p < lay.n_slots; ++p) {
+                    vhost_patterns.push_back("^blk\\.[0-9]+\\." + regex_escape_literal(lay.suffix[p]) + "\\.weight$");
+                }
+            } else {
+                std::vector<std::regex> user_re;
+                user_re.reserve(cfg.buft_overrides.size());
+                for (const std::string & pat : cfg.buft_overrides)
+                    user_re.emplace_back(pat);
+
+                std::vector<std::string> matched_routed;
+                size_t total_routed = 0;
+                for (const TensorExtent & ext : rem.meta.offsets.extents) {
+                    int elayer = 0;
+                    if (lay.slot_of(ext.name.c_str(), elayer) < 0) continue;
+                    ++total_routed;
+                    for (const std::regex & re : user_re) {
+                        if (std::regex_search(ext.name, re)) {
+                            matched_routed.push_back(ext.name);
+                            break;
+                        }
+                    }
+                }
+                if (matched_routed.size() == total_routed && total_routed > 0) {
+                    vhost_patterns.reserve((size_t) lay.n_slots);
+                    for (int p = 0; p < lay.n_slots; ++p) {
+                        vhost_patterns.push_back("^blk\\.[0-9]+\\." + regex_escape_literal(lay.suffix[p]) +
+                                                 "\\.weight$");
+                    }
+                } else {
+                    vhost_patterns.reserve(matched_routed.size());
+                    for (const std::string & name : matched_routed)
+                        vhost_patterns.push_back("^" + regex_escape_literal(name) + "$");
+                }
+            }
+        }
+    }
+
+    if (!vhost_patterns.empty() || !cfg.buft_overrides.empty()) {
+        buft_overrides.reserve(vhost_patterns.size() + cfg.buft_overrides.size() + 1);
+        ggml_backend_buffer_type_t vhost_buft = bmoe_virtual_host_buffer_type();
+        for (const std::string & pat : vhost_patterns)
+            buft_overrides.push_back({pat.c_str(), vhost_buft});
         for (const std::string & pat : cfg.buft_overrides)
             buft_overrides.push_back({pat.c_str(), ggml_backend_cpu_buffer_type()});
         buft_overrides.push_back({nullptr, nullptr}); // terminator
@@ -1163,8 +1280,76 @@ bool Session::Impl::load_model(Opening & o, llama_model ** reference) {
         mparams.kv_overrides = kv_overrides;
     }
 
-    llama_model * m = llama_model_load_from_file(cfg.model_path.c_str(), mparams);
-    if (!m) return o.fail("could not load the model: " + cfg.model_path);
+    llama_model * m = nullptr;
+    if (remote) {
+        const RemoteGgufMeta & rem = o.ensure_remote();
+        struct RemoteLoadState {
+            const GgufOffsets * offs = nullptr;
+            BlockProvider * prov = nullptr;
+            ggml_backend_buffer_type_t vhost_buft = nullptr;
+            std::vector<uint8_t> bounce;
+            bool failed = false;
+            std::string error;
+        };
+        RemoteLoadState rstate;
+        rstate.offs = &rem.meta.offsets;
+        rstate.prov = rem.provider.get();
+        rstate.vhost_buft = bmoe_virtual_host_buffer_type();
+
+        auto set_tensor_cb = [](ggml_tensor * t, void * vud) {
+            auto * st = static_cast<RemoteLoadState *>(vud);
+            if (!st || st->failed || !t) return;
+            // Skip virtual-host routed expert tensors: 0 HTTP bytes requested and 0 RAM committed.
+            if (t->buffer && ggml_backend_buffer_get_type(t->buffer) == st->vhost_buft) return;
+            const size_t total = ggml_nbytes(t);
+            if (total == 0) return;
+
+            auto it_off = st->offs->off_by_name.find(t->name);
+            auto it_file = st->offs->file_by_name.find(t->name);
+            if (it_off == st->offs->off_by_name.end() || it_file == st->offs->file_by_name.end()) {
+                st->failed = true;
+                st->error = std::string("remote GGUF missing offset for tensor ") + t->name;
+                return;
+            }
+            const uint64_t base_off = it_off->second;
+            const int shard = it_file->second;
+            constexpr size_t k_chunk = 4ull << 20;
+            const bool host_direct = t->buffer && ggml_backend_buffer_is_host(t->buffer) && t->data != nullptr;
+            if (!host_direct) {
+                const size_t want = std::min(total, k_chunk);
+                if (st->bounce.size() < want) st->bounce.resize(want);
+            }
+            for (size_t done = 0; done < total;) {
+                const size_t n = std::min(k_chunk, total - done);
+                if (host_direct) {
+                    if (st->prov->read(0, shard, static_cast<char *>(t->data) + done, base_off + done, n) !=
+                        (long long) n) {
+                        st->failed = true;
+                        st->error = std::string("HTTP read failed while loading tensor ") + t->name;
+                        return;
+                    }
+                } else {
+                    if (st->prov->read(0, shard, st->bounce.data(), base_off + done, n) != (long long) n) {
+                        st->failed = true;
+                        st->error = std::string("HTTP read failed while loading tensor ") + t->name;
+                        return;
+                    }
+                    ggml_backend_tensor_set(t, st->bounce.data(), done, n);
+                }
+                done += n;
+            }
+        };
+
+        m = llama_model_init_from_user(rem.gguf_ctx.get(), set_tensor_cb, &rstate, mparams);
+        if (rstate.failed) {
+            if (m) llama_model_free(m);
+            return o.fail(rstate.error);
+        }
+        if (!m) return o.fail("could not load remote model: " + cfg.model_path);
+    } else {
+        m = llama_model_load_from_file(cfg.model_path.c_str(), mparams);
+        if (!m) return o.fail("could not load the model: " + cfg.model_path);
+    }
     if (reference) {
         *reference = m;
         return true;
@@ -2089,7 +2274,7 @@ bool Session::Impl::bind_streaming(Opening & o) {
     if (prefill) prefill->keep_stream_layout(layers, offs.shard_paths);
     if (prefill && cfg.prefill.slots_on_demand) prefill->share_memory_with(&source);
     if (prefill) prefill->read_experts_from(&source);
-    if (!source.init(offs.shard_paths, n_expert, std::move(layers), cfg.moe))
+    if (!source.init(offs.shard_paths, n_expert, std::move(layers), cfg.moe, std::move(o.remote.provider)))
         return o.fail("expert stream source init failed");
     source.set_pin_floor(source.worst_cycle_bytes(n_expert_used));
     source.set_top_k(n_expert_used);
@@ -2098,19 +2283,21 @@ bool Session::Impl::bind_streaming(Opening & o) {
     // qualified or the takeover declined, and the hook then costs exactly nothing per node.
     hook->set_row_source(source.row_source());
 
-    release_mapping(cfg, offs, unaccounted);
-    // llama.cpp asks for the whole mapping to be read ahead at load (init_mappings prefetches every
-    // non-lazy range), so the model files fill the system's page cache with bytes this run reads
-    // otherwise: the experts through the streamer's direct reads, the dense set from its own copy, the
-    // tables row by row. Left there, the kernel under pressure swapped the expert cache out beside
-    // them, and the cache brake then halved it twice (a 30 GiB box with swap, Qwen3.8-Flash-Next:
-    // 23 GB of one shard and 21 GB of the other cached at load). Only where the dense set is held
-    // apart from the mapping; under `mmap` the page cache IS the dense set.
-    if (cfg.moe.dense_weights == DenseWeightsMode::Anonymous || cfg.moe.dense_weights == DenseWeightsMode::Pinned) {
-        for (const std::string & path : offs.shard_paths)
-            pio::drop_file_cache(path.c_str());
-        log_printf(LogLevel::Info, "page cache: the model files' read-ahead handed back (%zu file(s))",
-                   offs.shard_paths.size());
+    if (!is_remote_url(cfg.model_path)) {
+        release_mapping(cfg, offs, unaccounted);
+        // llama.cpp asks for the whole mapping to be read ahead at load (init_mappings prefetches every
+        // non-lazy range), so the model files fill the system's page cache with bytes this run reads
+        // otherwise: the experts through the streamer's direct reads, the dense set from its own copy, the
+        // tables row by row. Left there, the kernel under pressure swapped the expert cache out beside
+        // them, and the cache brake then halved it twice (a 30 GiB box with swap, Qwen3.8-Flash-Next:
+        // 23 GB of one shard and 21 GB of the other cached at load). Only where the dense set is held
+        // apart from the mapping; under `mmap` the page cache IS the dense set.
+        if (cfg.moe.dense_weights == DenseWeightsMode::Anonymous || cfg.moe.dense_weights == DenseWeightsMode::Pinned) {
+            for (const std::string & path : offs.shard_paths)
+                pio::drop_file_cache(path.c_str());
+            log_printf(LogLevel::Info, "page cache: the model files' read-ahead handed back (%zu file(s))",
+                       offs.shard_paths.size());
+        }
     }
 
     if (o.route_trace) arm_route_trace(o, n_expert, std::move(dense_bytes));

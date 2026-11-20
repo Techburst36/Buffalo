@@ -270,6 +270,24 @@ int main() {
         expect_ok("an MTP head with --mtp", c);
     }
 
+    // Remote HTTP streaming bounds (enforced whether streaming is on or off).
+    {
+        RunConfig c = ok_base();
+        c.moe.http_cache_mb = 0;
+        c.moe.http_threads = 0;
+        expect_ok("http defaults valid", c);
+        c.moe.http_cache_mb = 512;
+        c.moe.http_threads = MoeStreamConfig::http_threads_max;
+        expect_ok("http cache and max threads valid", c);
+        c.moe.http_cache_mb = -1;
+        expect_fail("http_cache_mb negative rejected", c);
+        c.moe.http_cache_mb = 0;
+        c.moe.http_threads = -1;
+        expect_fail("http_threads negative rejected", c);
+        c.moe.http_threads = MoeStreamConfig::http_threads_max + 1;
+        expect_fail("http_threads above max rejected", c);
+    }
+
     // Sampling ranges — enforced only when temp > 0.
     {
         RunConfig c = ok_base();

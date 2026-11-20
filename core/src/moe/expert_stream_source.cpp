@@ -36,7 +36,8 @@ ExpertStreamSource::~ExpertStreamSource() {
 bool ExpertStreamSource::init(const std::vector<std::string> & shard_paths,
                               int n_expert,
                               std::vector<LayerExperts> layers,
-                              const MoeStreamConfig & cfg) {
+                              const MoeStreamConfig & cfg,
+                              std::unique_ptr<BlockProvider> preopened_provider) {
     if (active_) return false;
     if (n_expert <= 0) {
         log_printf(LogLevel::Error, "expert streaming needs a MoE model (n_expert=%d)", n_expert);
@@ -99,11 +100,20 @@ bool ExpertStreamSource::init(const std::vector<std::string> & shard_paths,
         return false;
     }
 
-    // Pluggable block provider over all shards (auto = Linux io_uring with Posix fallback). Opened
-    // before any expert buffer is allocated, because the buffers are aligned to what the provider
-    // learns about the files: the coarsest granule over the shards, and never less than a page.
+    // Pluggable block provider over all shards (local: io_uring / posix; remote: http_range).
+    // Opened before any expert buffer is allocated, because buffers align to the provider's
+    // reported granule and never less than a page.
     const size_t max_slice = max_full_any / (size_t) n_expert_;
-    provider_ = open_local_block_provider(shard_paths, io_threads_, cfg.o_direct, max_slice, cfg.io_backend);
+    HttpProviderOptions http_opt;
+    http_opt.cache_dir = cfg.http_cache_dir;
+    http_opt.cache_bytes = (uint64_t) std::max(0, cfg.http_cache_mb) << 20;
+    http_opt.lanes = cfg.http_threads > 0 ? cfg.http_threads
+                                          : std::max(io_threads_, MoeStreamConfig::http_threads_default);
+    if (preopened_provider && preopened_provider->is_open()) {
+        provider_ = std::move(preopened_provider);
+    } else {
+        provider_ = open_block_provider(shard_paths, io_threads_, cfg.o_direct, max_slice, cfg.io_backend, http_opt);
+    }
     if (!provider_) return false;
     buf_align_ = std::max(page_, provider_->buffer_align());
 
@@ -125,7 +135,9 @@ bool ExpertStreamSource::init(const std::vector<std::string> & shard_paths,
         // dense set twice and overcommits by its whole size — enough to take the device down on a
         // model whose dense set is large (DeepSeek V4's is ~6.5 GiB). Budget as if the conversion
         // had already happened.
-        if (cfg.dense_weights == DenseWeightsMode::Anonymous || cfg.dense_weights == DenseWeightsMode::Pinned) {
+        const bool remote_model = is_remote_url(shard_paths[0]);
+        if (!remote_model &&
+            (cfg.dense_weights == DenseWeightsMode::Anonymous || cfg.dense_weights == DenseWeightsMode::Pinned)) {
             uint64_t dense_pending = 0;
             // The same rule dense_.init applies below: a tensor larger than what is available is
             // never converted, it stays mmap'd (qwen4exp's ~28.8 GB n-gram table). Counting it here
@@ -301,7 +313,7 @@ bool ExpertStreamSource::init(const std::vector<std::string> & shard_paths,
         dense_.set_row_gathered(std::move(row_tensors_), row_budget_);
         dense_.set_mapped(cfg.dense_mapped);
         if (!dense_.init(cfg.dense_weights, shard_paths, std::move(ranges), std::move(dense_tensors_),
-                         cfg.io_backend)) {
+                         cfg.io_backend, http_opt)) {
             log_printf(LogLevel::Error, "dense-weights init failed");
             return false;
         }

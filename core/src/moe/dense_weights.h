@@ -75,7 +75,8 @@ public:
               const std::vector<std::string> & paths,
               std::vector<std::vector<std::pair<uint64_t, uint64_t>>> ranges,
               std::vector<DenseTensorRef> tensors,
-              IoBackend io_backend = IoBackend::Auto);
+              IoBackend io_backend = IoBackend::Auto,
+              const HttpProviderOptions & http_opt = {});
 
     // Tables the graph only ever ROW-GATHERS (discovered by RouterHook, never named here): instead
     // of being made resident, they are bound to reserved address space and served from flash a row
@@ -144,6 +145,8 @@ private:
 
     DenseWeightsMode mode_ = DenseWeightsMode::Warmed;
     IoBackend io_backend_ = IoBackend::Auto;
+    HttpProviderOptions http_opt_;
+    bool remote_ = false;
     std::vector<std::string> paths_; // one per shard, in shard order
 
     // Anonymous/Pinned: our own BlockProvider over all shards, the tensors we read, and the buffers

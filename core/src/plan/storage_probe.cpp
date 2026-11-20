@@ -20,6 +20,7 @@
 
 #include "bmoe/probe.h"
 
+#include "../io/block_provider.h"
 #include "../io/file_reader.h"
 
 #include <algorithm>
@@ -281,6 +282,11 @@ int requests_per_lane(uint64_t block, int lanes, uint64_t target_bytes, int floo
 
 void probe_storage(HardwareProfile & hw, const char * model_path, uint64_t slice_bytes) {
     if (!model_path || !*model_path) return;
+    if (is_remote_url(model_path)) {
+        hw.storage.direct_ok = Tri::No;
+        hw.storage.align = 1;
+        return;
+    }
 
     const uint64_t slice = slice_bytes ? slice_bytes : (512u << 10);
     const int per_lane = 40; // per point on the curve's shape: one short sample says enough

@@ -43,11 +43,13 @@ if(BMOE_HAVE_LLAMA)
         src/io/platform_io.cpp
         src/io/file_reader.cpp
         src/io/block_provider.cpp
+        src/io/http_range_provider.cpp
         src/io/mapping_release.cpp
         src/io/parallel_copy.cpp
         src/moe/dense_weights.cpp
         src/moe/row_stream.cpp
         src/moe/gguf_offsets.cpp
+        src/moe/virtual_host_buft.cpp
         src/plan/hardware_probe.cpp
         src/plan/headroom_probe.cpp
         src/plan/bandwidth_probe.cpp
@@ -92,7 +94,12 @@ if(BMOE_HAVE_LLAMA)
     # tool, built standalone through upstream's own LLAMA_BUILD_MTMD hook; not patched.
     target_link_libraries(bmoe_core PUBLIC llama llama-common mtmd)
     # The image header probe (image_probe.cpp) reads with the same stb_image the library decodes with.
-    target_link_libraries(bmoe_core PRIVATE vendor::stb)
+    # HttpRangeProvider uses llama.cpp's vendored cpp-httplib (plain HTTP, no OpenSSL/libcurl).
+    target_link_libraries(bmoe_core PRIVATE vendor::stb vendor::cpp-httplib)
+    target_include_directories(bmoe_core SYSTEM PRIVATE
+        ${CMAKE_SOURCE_DIR}/third_party/llama.cpp/vendor
+        ${CMAKE_SOURCE_DIR}/third_party/llama.cpp/ggml/src
+    )
     target_compile_definitions(bmoe_core PUBLIC BMOE_HAVE_LLAMA=1)
     find_package(Threads REQUIRED)
     target_link_libraries(bmoe_core PUBLIC Threads::Threads)

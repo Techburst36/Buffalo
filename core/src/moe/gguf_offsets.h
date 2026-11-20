@@ -11,11 +11,15 @@
 #pragma once
 
 #include "bmoe/expert_layout.h"
+#include "../io/block_provider.h"
 
 #include <cstdint>
+#include <memory>
 #include <string>
 #include <unordered_map>
 #include <vector>
+
+struct gguf_context;
 
 namespace bmoe {
 
@@ -95,5 +99,27 @@ struct GgufMeta {
     bool ok = false; // both parses' ok, from the single underlying open
 };
 GgufMeta read_gguf_meta(const char * path);
+
+// Remote HTTP GGUF metadata loaded via gguf_init_from_callback() with exact zero-overshoot
+// structural prefetching (never reads into tensor data or routed experts). For split remote
+// models, merges all shard tensor descriptors into one gguf_context (split.count = 1) while
+// keeping real per-shard offsets in `meta.offsets`, and returns the opened HttpRangeProvider
+// so callers (Session::load_model + ExpertStreamSource) reuse its keep-alive pool directly.
+struct RemoteGgufMeta {
+    GgufMeta meta;
+    std::unique_ptr<gguf_context, void (*)(gguf_context *)> gguf_ctx;
+    std::unique_ptr<BlockProvider> provider;
+    std::string error;
+    bool ok = false;
+
+    RemoteGgufMeta();
+    ~RemoteGgufMeta();
+    RemoteGgufMeta(RemoteGgufMeta &&) noexcept;
+    RemoteGgufMeta & operator=(RemoteGgufMeta &&) noexcept;
+};
+
+RemoteGgufMeta read_remote_gguf_meta(const char * url,
+                                     int lanes = 0,
+                                     const HttpProviderOptions & http_opt = {});
 
 } // namespace bmoe

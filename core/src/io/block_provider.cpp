@@ -1,6 +1,7 @@
 #include "block_provider.h"
 #include "bmoe/log.h"
 #include "file_reader.h"
+#include "http_range_provider.h"
 #include "platform_io.h"
 
 #ifdef BMOE_HAS_IO_URING
@@ -11,7 +12,9 @@
 #endif
 
 #include <algorithm>
+#include <cctype>
 #include <chrono>
+#include <cstdio>
 
 namespace bmoe {
 
@@ -150,6 +153,93 @@ std::unique_ptr<BlockProvider> open_local_block_provider(const std::vector<std::
     auto posix = std::make_unique<PosixBlockProvider>();
     if (!posix->open(paths, lanes, direct, max_read)) return nullptr;
     return posix;
+}
+
+static bool starts_with_ci(const std::string & s, const char * prefix) {
+    for (size_t i = 0; prefix[i] != '\0'; ++i) {
+        if (i >= s.size()) return false;
+        if (std::tolower((unsigned char) s[i]) != std::tolower((unsigned char) prefix[i])) return false;
+    }
+    return true;
+}
+
+bool is_http_url(const std::string & path) {
+    return starts_with_ci(path, "http://");
+}
+
+bool is_https_url(const std::string & path) {
+    return starts_with_ci(path, "https://");
+}
+
+bool is_remote_url(const std::string & path) {
+    return is_http_url(path) || is_https_url(path);
+}
+
+std::vector<std::string> expand_split_urls(const std::string & url) {
+    // Strip optional ?query / #fragment before inspecting the split suffix so presigned URLs work.
+    size_t cut = url.find_first_of("?#");
+    const std::string base = cut == std::string::npos ? url : url.substr(0, cut);
+    const std::string query =
+        (cut != std::string::npos && url[cut] == '?') ? url.substr(cut, url.find('#', cut) - cut) : std::string();
+
+    // <prefix>-DDDDD-of-DDDDD.gguf -> 19 chars after the separating dash
+    static constexpr size_t tail_len = 5 + 4 + 5 + 5;
+    if (base.size() < tail_len + 1) return {url};
+    const size_t tail = base.size() - tail_len;
+    auto five_digits = [&](size_t at) {
+        for (size_t i = at; i < at + 5; ++i)
+            if (base[i] < '0' || base[i] > '9') return false;
+        return true;
+    };
+    if (base[tail - 1] != '-' || !five_digits(tail) || base.compare(tail + 5, 4, "-of-") != 0 ||
+        !five_digits(tail + 9) || base.compare(tail + 14, 5, ".gguf") != 0)
+        return {url};
+
+    const int no = std::stoi(base.substr(tail, 5));
+    const int count = std::stoi(base.substr(tail + 9, 5));
+    if (count <= 1) return {url};
+    if (no != 1) {
+        log_printf(LogLevel::Error, "%s is shard %d of a split model — pass the first shard (-00001-of-)", url.c_str(),
+                   no);
+        return {};
+    }
+
+    const std::string prefix = base.substr(0, tail - 1);
+    std::vector<std::string> out;
+    out.reserve((size_t) count);
+    for (int i = 1; i <= count; ++i) {
+        char buf[32];
+        std::snprintf(buf, sizeof(buf), "-%05d-of-%05d.gguf", i, count);
+        out.push_back(prefix + buf + query);
+    }
+    return out;
+}
+
+std::unique_ptr<BlockProvider> open_block_provider(const std::vector<std::string> & paths,
+                                                   int lanes,
+                                                   bool direct,
+                                                   size_t max_read,
+                                                   IoBackend pref,
+                                                   const HttpProviderOptions & http_opt,
+                                                   std::string * error) {
+    if (paths.empty()) {
+        if (error) *error = "no model paths provided";
+        return nullptr;
+    }
+    if (is_remote_url(paths[0])) {
+        auto http = std::make_unique<HttpRangeProvider>();
+        const int eff_lanes = http_opt.lanes > 0 ? http_opt.lanes : std::max(1, lanes);
+        std::string err;
+        if (!http->open(paths, eff_lanes, http_opt, &err)) {
+            if (error) *error = err;
+            log_printf(LogLevel::Error, "http block provider failed: %s", err.c_str());
+            return nullptr;
+        }
+        return http;
+    }
+    auto local = open_local_block_provider(paths, lanes, direct, max_read, pref);
+    if (!local && error) *error = "could not open local model shard(s): " + paths[0];
+    return local;
 }
 
 } // namespace bmoe
