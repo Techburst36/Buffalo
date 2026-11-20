@@ -42,6 +42,7 @@ if(BMOE_HAVE_LLAMA)
     target_sources(bmoe_core PRIVATE
         src/io/platform_io.cpp
         src/io/file_reader.cpp
+        src/io/block_provider.cpp
         src/io/mapping_release.cpp
         src/io/parallel_copy.cpp
         src/moe/dense_weights.cpp
@@ -112,6 +113,15 @@ if(BMOE_HAVE_LLAMA)
         # QueryWorkingSetEx, behind the dense residency sensor (pio::vm_resident_sample). Newer SDKs
         # resolve it from kernel32; the import library covers the ones that do not.
         target_link_libraries(bmoe_core PUBLIC psapi)
+    endif()
+
+    if(CMAKE_SYSTEM_NAME STREQUAL "Linux" AND BMOE_IO_URING)
+        include(CheckIncludeFile)
+        check_include_file("linux/io_uring.h" BMOE_HAVE_LINUX_IO_URING)
+        if(BMOE_HAVE_LINUX_IO_URING)
+            target_sources(bmoe_core PRIVATE src/io/iouring_provider.cpp)
+            target_compile_definitions(bmoe_core PUBLIC BMOE_HAS_IO_URING=1)
+        endif()
     endif()
 
     # Intra-layer I/O–compute overlap needs the fork's expert-ready hook in the CPU backend. It is

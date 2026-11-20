@@ -35,8 +35,10 @@ DenseWeights::byte_ranges(std::vector<std::pair<uint64_t, uint64_t>> expert_rang
 bool DenseWeights::init(DenseWeightsMode mode,
                         const std::vector<std::string> & paths,
                         std::vector<std::vector<std::pair<uint64_t, uint64_t>>> ranges,
-                        std::vector<DenseTensorRef> tensors) {
+                        std::vector<DenseTensorRef> tensors,
+                        IoBackend io_backend) {
     mode_ = mode;
+    io_backend_ = io_backend;
     paths_ = paths;
     ranges_ = std::move(ranges);
     tensors_ = std::move(tensors);
@@ -55,19 +57,17 @@ bool DenseWeights::init(DenseWeightsMode mode,
                                         "platform does not provide");
             return false;
         }
-        // Single-lane readers (one per shard) with a bounce large enough for our chunk; O_DIRECT
+        // Single-lane provider over all shards with a bounce large enough for our chunk; O_DIRECT
         // independent of the expert stream. Sized to the largest tensor is unnecessary — we read in
         // bounded chunks.
         const size_t chunk = 8ull << 20;
-        for (const std::string & p : paths_) {
-            readers_.push_back(std::unique_ptr<FileReader>(new FileReader()));
-            if (!readers_.back()->open(p, 1, /*direct=*/true, chunk)) return false;
-        }
+        provider_ = open_local_block_provider(paths_, 1, /*direct=*/true, chunk, io_backend_);
+        if (!provider_) return false;
         if (!read_anonymous()) return false;
-        // The tensors are copied and rebound; nothing reads through these again. Their fds and
-        // per-lane bounce buffers would otherwise sit allocated for the whole session, next to
+        // The tensors are copied and rebound; nothing reads through this again. Its fds and
+        // bounce buffers would otherwise sit allocated for the whole session, next to
         // the expert cache that is counting every MiB.
-        readers_.clear();
+        provider_.reset();
         drop_mmap_copies(pio::vm_page());
     } else if (mode_ == DenseWeightsMode::Warmed) {
         warm();
@@ -194,7 +194,7 @@ void DenseWeights::take_row_gathered() {
     if (take.empty()) return;
 
     rows_.reset(new RowStream());
-    if (!rows_->init(take, paths_, row_budget_) || rows_->empty()) {
+    if (!rows_->init(take, paths_, row_budget_, io_backend_) || rows_->empty()) {
         rows_.reset();
         return; // the tables keep the mode the run asked for
     }
@@ -262,8 +262,8 @@ bool DenseWeights::read_anonymous() {
     if (pinned) pinned_.reserve(tensors_.size());
     for (const DenseTensorRef & d : tensors_) {
         if (!d.tensor || d.size == 0) continue;
-        if (d.file_idx < 0 || d.file_idx >= (int) readers_.size()) {
-            log_printf(LogLevel::Error, "dense tensor points at shard %d of %zu", d.file_idx, readers_.size());
+        if (d.file_idx < 0 || d.file_idx >= provider_->shard_count()) {
+            log_printf(LogLevel::Error, "dense tensor points at shard %d of %d", d.file_idx, provider_->shard_count());
             return false;
         }
         void * buf = nullptr;
@@ -289,7 +289,7 @@ bool DenseWeights::read_anonymous() {
             if (mode_ == DenseWeightsMode::Pinned) pin_refused_bytes_ += d.size;
             // Aligned for the reader that fills it, and to a page for the sensor and the drop that
             // later clip this buffer to pages.
-            buf = pio::alloc_aligned(readers_[(size_t) d.file_idx]->buffer_align(), held);
+            buf = pio::alloc_aligned(provider_->buffer_align(), held);
             if (!buf) {
                 log_printf(LogLevel::Error, "dense buffer alloc %llu failed", (unsigned long long) d.size);
                 return false;
@@ -300,7 +300,7 @@ bool DenseWeights::read_anonymous() {
         buf_sz_.push_back((size_t) d.size);
         for (uint64_t done = 0; done < d.size;) {
             const uint64_t n = std::min<uint64_t>(chunk, d.size - done);
-            if (readers_[(size_t) d.file_idx]->read(0, (char *) buf + done, d.file_off + done, n) < 0) return false;
+            if (provider_->read(0, d.file_idx, (char *) buf + done, d.file_off + done, n) < 0) return false;
             done += n;
         }
         d.tensor->data = buf; // rebind the model weight onto its private copy
@@ -496,7 +496,7 @@ void DenseWeights::shutdown() {
     bases_.clear();
     buf_sz_.clear();
     tensors_.clear();
-    readers_.clear();
+    provider_.reset();
 }
 
 } // namespace bmoe

@@ -506,6 +506,22 @@ std::vector<ParamDesc> build() {
         t.push_back(d);
     }
     {
+        ParamDesc d = row("io-backend", "Storage I/O backend", G::Streaming, L::Advanced,
+                          "Block I/O backend for streamed reads: auto prefers Linux io_uring where available and falls "
+                          "back to posix; posix uses cross-platform positioned reads; io_uring requests raw Linux "
+                          "io_uring batched reads (falling back to posix if blocked by kernel or sandbox).");
+        d.type = ParamType::Choice;
+        d.value_hint = "auto|posix|io_uring";
+        using B = IoBackend;
+        bind_choice<B>(d, [](RunConfig & c) -> B & { return c.moe.io_backend; },
+                       {{B::Auto, {io_backend_name(B::Auto), "auto (io_uring with posix fallback)"}},
+                        {B::Posix, {io_backend_name(B::Posix), "cross-platform positioned reads"}},
+                        {B::IoUring, {io_backend_name(B::IoUring), "Linux io_uring batched reads"}}});
+        d.details = "Selects the storage reader backend behind expert, dense, and row streaming. Auto uses Linux "
+                    "io_uring when permitted by the kernel and falls back cleanly to standard positioned reads.";
+        t.push_back(d);
+    }
+    {
         ParamDesc d = row("o-direct", "Direct I/O", G::Streaming, L::Advanced,
                           "Bypass the page cache for expert reads (O_DIRECT / FILE_FLAG_NO_BUFFERING).");
         d.type = ParamType::Bool;

@@ -98,7 +98,8 @@ bool DeviceExpertArena::init(ggml_backend_dev_t dev,
                              bool direct,
                              int n_slots,
                              bool on_demand,
-                             std::string & err) {
+                             std::string & err,
+                             IoBackend io_backend) {
     if (!dev || threads < 1) {
         err = "no device or no loader thread";
         return false;
@@ -218,16 +219,13 @@ bool DeviceExpertArena::init(ggml_backend_dev_t dev,
     // Held for the session, or built for each prefill and given back after it (see acquire()).
     if (!on_demand_ && !build_slots(err)) return false;
 
-    // Staging is filled by every shard's reader, so it is aligned for the coarsest of them.
-    size_t stage_align = pio::vm_page();
-    for (const std::string & sp : shard_paths) {
-        readers_.push_back(std::unique_ptr<FileReader>(new FileReader()));
-        if (!readers_.back()->open(sp, threads, direct, (size_t) max_nb2)) {
-            err = "cannot open " + sp;
-            return false;
-        }
-        stage_align = std::max(stage_align, readers_.back()->buffer_align());
+    // Staging is filled by the provider over all shards, so it is aligned for the coarsest of them.
+    provider_ = open_local_block_provider(shard_paths, threads, direct, (size_t) max_nb2, io_backend);
+    if (!provider_) {
+        err = "cannot open model shard(s)";
+        return false;
     }
+    const size_t stage_align = std::max(pio::vm_page(), provider_->buffer_align());
     staging_.assign((size_t) threads, nullptr);
     for (int i = 0; i < threads; ++i) {
         staging_[(size_t) i] = pio::alloc_aligned(stage_align, (size_t) max_nb2);
@@ -724,7 +722,7 @@ void DeviceExpertArena::worker(int lane) {
         }
         void * stage = staging_[(size_t) lane];
         const long long got =
-            readers_[(size_t) pr.file_idx]->read(lane, stage, pr.file_off + (uint64_t) task.e * pr.nb2, pr.nb2);
+            provider_->read(lane, pr.file_idx, stage, pr.file_off + (uint64_t) task.e * pr.nb2, pr.nb2);
         if (got < 0) {
             failed_ = true;
         } else {

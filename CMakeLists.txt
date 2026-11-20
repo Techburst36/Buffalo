@@ -47,6 +47,7 @@ option(BMOE_BUILD_DESKTOP "Build bmoe-desktop, the app window that runs bmoe-ser
 # Off by default: diagnostics, not part of the product. They need no llama.cpp, so they can be
 # configured and cross-compiled on their own without building the engine.
 option(BMOE_BUILD_TOOLS "Build standalone diagnostic tools (bmoe-iobench)" OFF)
+option(BMOE_IO_URING    "Enable raw Linux io_uring BlockProvider"          ON)
 # Every ggml backend as a module loaded from beside the executable at start-up, and the CPU backend
 # once per instruction-set tier. The engine then knows no backend at compile time; the same layout
 # ships on every OS; a module whose driver library is missing fails to load and is simply not

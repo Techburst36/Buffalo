@@ -161,6 +161,12 @@ target_link_libraries(bmoe_file_reader_test PRIVATE bmoe_core)
 target_include_directories(bmoe_file_reader_test PRIVATE ${CMAKE_SOURCE_DIR}/core/src/io)
 add_test(NAME file_reader COMMAND bmoe_file_reader_test)
 
+# BlockProvider: PosixBlockProvider + Linux IoUringBlockProvider (or graceful fallback under seccomp).
+add_executable(bmoe_block_provider_test block_provider_test.cpp)
+target_link_libraries(bmoe_block_provider_test PRIVATE bmoe_core)
+target_include_directories(bmoe_block_provider_test PRIVATE ${CMAKE_SOURCE_DIR}/core/src/io)
+add_test(NAME block_provider COMMAND bmoe_block_provider_test)
+
 # self_path: the executable's own file with every link resolved, so a link on PATH (what install.sh
 # puts there) still finds the backend modules beside the real file (#605). Starts itself again
 # through a link; no model.

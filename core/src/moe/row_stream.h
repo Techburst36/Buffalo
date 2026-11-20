@@ -26,8 +26,9 @@
 // gathers few distinct rows simply never fills it.
 #pragma once
 
-#include "../io/file_reader.h"
+#include "../io/block_provider.h"
 #include "../io/platform_io.h"
+#include "bmoe/config.h" // IoBackend
 #include "bmoe/row_source.h"
 #include "dense_weights.h" // DenseTensorRef
 
@@ -56,7 +57,10 @@ public:
     // ceiling on resident slabs across all tables (0 = a built-in default). Returns false only if a
     // table could not be taken over at all, in which case NOTHING has been rebound and the caller
     // keeps its own policy: this module never leaves a tensor half-owned.
-    bool init(std::vector<DenseTensorRef> tensors, const std::vector<std::string> & paths, uint64_t budget_bytes);
+    bool init(std::vector<DenseTensorRef> tensors,
+              const std::vector<std::string> & paths,
+              uint64_t budget_bytes,
+              IoBackend io_backend = IoBackend::Auto);
 
     bool empty() const { return tables_.empty(); }
 
@@ -107,8 +111,8 @@ private:
     void release();
 
     std::vector<Table> tables_;
-    std::vector<std::unique_ptr<FileReader>> readers_; // one per shard; FileReader is not movable
-    std::list<std::pair<size_t, uint64_t>> lru_;       // (table index, slab index), oldest first
+    std::unique_ptr<BlockProvider> provider_;
+    std::list<std::pair<size_t, uint64_t>> lru_; // (table index, slab index), oldest first
     uint64_t budget_bytes_ = default_budget_bytes;
     uint64_t table_bytes_ = 0; // total size of the tables taken over
     uint64_t page_ = pio::vm_page();

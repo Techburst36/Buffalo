@@ -28,7 +28,7 @@
 #pragma once
 
 #include "expert_stream_source.h"
-#include "../io/file_reader.h"
+#include "../io/block_provider.h"
 
 #include "ggml-backend.h"
 
@@ -71,7 +71,8 @@ public:
               bool direct,
               int n_slots,
               bool on_demand,
-              std::string & err);
+              std::string & err,
+              IoBackend io_backend = IoBackend::Auto);
 
     // `on_demand` (init): the expert slots are not held for the session. acquire() builds them
     // before a device graph and release() gives them back after the last one, so between prefills
@@ -229,7 +230,7 @@ private:
     bool build_slots(std::string & err);
     void free_slots();
 
-    std::vector<std::unique_ptr<FileReader>> readers_;
+    std::unique_ptr<BlockProvider> provider_;
     std::vector<void *> staging_; // one per lane
     std::vector<std::thread> threads_;
 

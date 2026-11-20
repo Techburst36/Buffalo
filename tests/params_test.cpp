@@ -228,6 +228,10 @@ int main() {
     expect_flag({"--no-warm-dense"}, [](const RunConfig & c) { return c.moe.dense_weights == DenseWeightsMode::Mmap; });
     expect_flag({"--dense-weights", "mmap", "--dense-odirect"},
                 [](const RunConfig & c) { return c.moe.dense_weights == DenseWeightsMode::Anonymous; });
+    expect_flag({"--io-backend", "auto"}, [](const RunConfig & c) { return c.moe.io_backend == IoBackend::Auto; });
+    expect_flag({"--io-backend", "posix"}, [](const RunConfig & c) { return c.moe.io_backend == IoBackend::Posix; });
+    expect_flag({"--io-backend", "io_uring"},
+                [](const RunConfig & c) { return c.moe.io_backend == IoBackend::IoUring; });
     expect_flag({"--load-all"}, [](const RunConfig & c) { return c.moe.load_all; });
     expect_flag({"--llama-debug"}, [](const RunConfig & c) { return c.llama_debug_log; });
     expect_flag({"--force-cache"}, [](const RunConfig & c) { return c.moe.force_cache; });
@@ -272,6 +276,7 @@ int main() {
     expect_reject({"--threads"});
     expect_reject({"--cache-mb", "big"});
     expect_reject({"--dense-weights", "foo"});
+    expect_reject({"--io-backend", "magic"});
     expect_reject({"--temp", "hot"});
     expect_reject({"--seed", "-1"});
     expect_reject({"--seed", "4294967296"});

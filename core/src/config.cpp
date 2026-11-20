@@ -28,12 +28,28 @@ constexpr DenseWeightsModeName kDenseWeightsModes[] = {
     {DenseWeightsMode::Pinned, "pinned"},
 };
 
+struct IoBackendName {
+    IoBackend backend;
+    const char * name;
+};
+constexpr IoBackendName kIoBackends[] = {
+    {IoBackend::Auto, "auto"},
+    {IoBackend::Posix, "posix"},
+    {IoBackend::IoUring, "io_uring"},
+};
+
 } // namespace
 
 const char * dense_weights_mode_name(DenseWeightsMode m) {
     for (const auto & e : kDenseWeightsModes)
         if (e.mode == m) return e.name;
     return kDenseWeightsModes[0].name;
+}
+
+const char * io_backend_name(IoBackend b) {
+    for (const auto & e : kIoBackends)
+        if (e.backend == b) return e.name;
+    return kIoBackends[0].name;
 }
 
 const char * prefix_cache_mode_name(PrefixCacheMode m) {

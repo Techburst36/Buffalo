@@ -49,6 +49,14 @@ enum class DenseWeightsMode {
 // telemetry.
 const char * dense_weights_mode_name(DenseWeightsMode m);
 
+// Local block I/O backend behind BlockProvider (auto = prefer Linux io_uring with Posix fallback).
+enum class IoBackend {
+    Auto,
+    Posix,
+    IoUring,
+};
+const char * io_backend_name(IoBackend b);
+
 // Whether route-ahead's prediction scores against an int8 mirror of the router gates or their own
 // float weights (MoeStreamConfig::gate_mirror). Both rank the same experts to within an int8 step;
 // they differ in cost, and which is cheaper is a property of the machine, so neither is a default.
@@ -106,7 +114,8 @@ struct MoeStreamConfig {
     // Clamped to [1, io_threads_max]. 4 is the measured sweet spot on UFS4 phones.
     int io_threads = 4;
 
-    bool o_direct = true;     // bypass the page cache (O_DIRECT / FILE_FLAG_NO_BUFFERING)
+    IoBackend io_backend = IoBackend::Auto; // storage I/O provider: auto | posix | io_uring
+    bool o_direct = true;                   // bypass the page cache (O_DIRECT / FILE_FLAG_NO_BUFFERING)
     bool load_all = false;    // debug/A-B: load ALL experts each token (full-sweep baseline)
     bool force_cache = false; // allow a cache_mb in the pathological band (tests/experiments)
 

@@ -19,7 +19,8 @@ static uint64_t round_up(uint64_t v, uint64_t a) {
 
 bool RowStream::init(std::vector<DenseTensorRef> tensors,
                      const std::vector<std::string> & paths,
-                     uint64_t budget_bytes) {
+                     uint64_t budget_bytes,
+                     IoBackend io_backend) {
     if (tensors.empty()) return true;
     page_ = pio::vm_page();
     slab_ = round_up(slab_min_bytes, page_);
@@ -28,23 +29,21 @@ bool RowStream::init(std::vector<DenseTensorRef> tensors,
     // than reject the run: the caller asked for "as little as possible", not for a stall.
     budget_bytes_ = std::max<uint64_t>(budget_bytes_, slab_);
 
-    // One single-lane reader per shard, sized for a slab window. Independent of both the expert
-    // stream's readers and the dense loader's, for the same reason theirs are independent of each
+    // Single-lane provider over all shards, sized for a slab window. Independent of both the expert
+    // stream's provider and the dense loader's, for the same reason theirs are independent of each
     // other: the O_DIRECT decision belongs to the consumer, not to the file.
-    for (const std::string & p : paths) {
-        readers_.push_back(std::unique_ptr<FileReader>(new FileReader()));
-        if (!readers_.back()->open(p, 1, /*direct=*/true, (size_t) slab_)) {
-            log_printf(LogLevel::Warn, "row-stream could not open %s — tables keep the dense policy", p.c_str());
-            readers_.clear();
-            return false;
-        }
+    provider_ = open_local_block_provider(paths, 1, /*direct=*/true, (size_t) slab_, io_backend);
+    if (!provider_) {
+        log_printf(LogLevel::Warn, "row-stream could not open model shard(s) — tables keep the dense policy");
+        return false;
     }
 
     tables_.reserve(tensors.size());
     for (const DenseTensorRef & d : tensors) {
         if (!d.tensor || d.size == 0) continue;
-        if (d.file_idx < 0 || (size_t) d.file_idx >= readers_.size()) {
-            log_printf(LogLevel::Error, "row-stream tensor points at shard %d of %zu", d.file_idx, readers_.size());
+        if (d.file_idx < 0 || d.file_idx >= provider_->shard_count()) {
+            log_printf(LogLevel::Error, "row-stream tensor points at shard %d of %d", d.file_idx,
+                       provider_->shard_count());
             release();
             return false;
         }
@@ -72,7 +71,7 @@ bool RowStream::init(std::vector<DenseTensorRef> tensors,
     }
 
     if (tables_.empty()) { // nothing qualified after the shape check
-        readers_.clear();
+        provider_.reset();
         return true;
     }
 
@@ -134,7 +133,7 @@ bool RowStream::fetch_slab(Table & t, uint64_t s) {
         io_errors_.fetch_add(1, std::memory_order_relaxed);
         return false;
     }
-    const long long got = readers_[(size_t) t.ref.file_idx]->read(0, t.base + off, t.ref.file_off + off, len);
+    const long long got = provider_->read(0, t.ref.file_idx, t.base + off, t.ref.file_off + off, len);
     if (got < 0) {
         log_printf(LogLevel::Error, "row-stream read failed at slab %llu of %s", (unsigned long long) s,
                    t.ref.tensor->name);
@@ -261,16 +260,13 @@ void RowStream::release() {
     }
     tables_.clear();
     lru_.clear();
-    readers_.clear();
+    provider_.reset();
     resident_bytes_.store(0, std::memory_order_relaxed);
     table_bytes_ = 0;
 }
 
 bool RowStream::reopen_readers() {
-    bool ok = true;
-    for (auto & r : readers_)
-        ok = r->reopen() && ok;
-    return ok;
+    return provider_ ? provider_->reopen() : true;
 }
 
 void RowStream::shutdown() {

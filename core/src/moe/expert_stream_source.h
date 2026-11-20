@@ -20,7 +20,7 @@
 #include "stall_union.h"
 #include "bmoe/expert_layout.h"
 #include "../io/platform_io.h"
-#include "../io/file_reader.h"
+#include "../io/block_provider.h"
 #include "dense_weights.h" // DenseWeights + DenseTensorRef
 #include "discardable_entries.h"
 
@@ -219,6 +219,7 @@ private:
     // `j` carries the read AND (for the trace) what it serves; `lane` is who is doing it.
     bool read_slice(int lane, const IoJob & j);
     void io_drain(int lane, uint64_t my_gen);
+    void io_drain_batch(uint64_t my_gen);
     void io_worker(int lane);
 
     // Speculative prefetch (temporal): drain queued spec reads on an idle lane, and integrate /
@@ -346,14 +347,15 @@ private:
     // less than a page. Settled at init, once the readers have asked the files.
     size_t buf_align_ = 0;
 
-    // The positioned readers that own the fd pools, bounces and O_DIRECT decision — one per shard
-    // file, in shard order (a single-file model has exactly one). Expert slices are read through
-    // them; the dense-weights loader constructs its own, so their O_DIRECT choices are independent
-    // (see docs/architecture.md). FileReader is not movable, hence the unique_ptr.
-    std::vector<std::unique_ptr<FileReader>> readers_;
-    // Whether every shard reader actually got cache bypass (see FileReader::direct) — the AND over
-    // shards, settled at init before any worker thread exists and reported verbatim by stats(). The
-    // run-level o_direct fact: what the platform served, not what the flag asked for.
+    // The pluggable block provider owning all shard descriptors, alignment/bounce state, and
+    // O_DIRECT / io_uring backend choice. The dense-weights loader opens its own provider so their
+    // cache-bypass choices stay independent (see docs/architecture.md).
+    std::unique_ptr<BlockProvider> provider_;
+    std::vector<BlockReadReq> batch_reqs_; // reused scratch for provider_->read_batch()
+    std::vector<IoJob> batch_jobs_;        // reused scratch for batched async drain
+    // Whether every shard actually got cache bypass (see BlockProvider::direct) — settled at init
+    // before any worker thread exists and reported verbatim by stats(). The run-level o_direct fact:
+    // what the platform served, not what the flag asked for.
     bool effective_direct_ = false;
 
     std::vector<LayerExperts> layers_;

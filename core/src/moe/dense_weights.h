@@ -16,9 +16,9 @@
 // the set. A single-file model is the one-entry case of the same shape, not a separate path.
 #pragma once
 
-#include "../io/file_reader.h"
+#include "../io/block_provider.h"
 #include "../io/platform_io.h"
-#include "bmoe/config.h" // DenseWeightsMode
+#include "bmoe/config.h" // DenseWeightsMode, IoBackend
 #include "bmoe/row_source.h"
 
 #include <cstdint>
@@ -74,7 +74,8 @@ public:
     bool init(DenseWeightsMode mode,
               const std::vector<std::string> & paths,
               std::vector<std::vector<std::pair<uint64_t, uint64_t>>> ranges,
-              std::vector<DenseTensorRef> tensors);
+              std::vector<DenseTensorRef> tensors,
+              IoBackend io_backend = IoBackend::Auto);
 
     // Tables the graph only ever ROW-GATHERS (discovered by RouterHook, never named here): instead
     // of being made resident, they are bound to reserved address space and served from flash a row
@@ -142,13 +143,14 @@ private:
     const char * addr_of(int file_idx, uint64_t off) const;
 
     DenseWeightsMode mode_ = DenseWeightsMode::Warmed;
+    IoBackend io_backend_ = IoBackend::Auto;
     std::vector<std::string> paths_; // one per shard, in shard order
 
-    // Anonymous/Pinned: our own readers (one per shard; FileReader is not movable, hence the
-    // unique_ptr), the tensors we read, and the buffers backing them. `bases_` is what the sensor
-    // probes and is filled by both modes; `bufs_` and `pinned_` are the two release lists. Both
-    // are populated only on a run whose pinned store ran out part way.
-    std::vector<std::unique_ptr<FileReader>> readers_;
+    // Anonymous/Pinned: our own BlockProvider over all shards, the tensors we read, and the buffers
+    // backing them. `bases_` is what the sensor probes and is filled by both modes; `bufs_` and
+    // `pinned_` are the two release lists. Both are populated only on a run whose pinned store ran
+    // out part way.
+    std::unique_ptr<BlockProvider> provider_;
     std::vector<DenseTensorRef> tensors_;
     std::vector<DenseTensorRef> mapped_; // held back by hold_back_oversized: mmap'd under every mode
     // Row-gathered tables: what was asked for, the window budget, and the policy that owns them.

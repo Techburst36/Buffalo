@@ -99,19 +99,13 @@ bool ExpertStreamSource::init(const std::vector<std::string> & shard_paths,
         return false;
     }
 
-    // Read pool: one reader per shard file, each owning a private fd + bounce per lane so concurrent
-    // preads never contend, and the O_DIRECT request + its verify/fallback (per file — a shard set
-    // could in principle straddle storage with different O_DIRECT behaviour). The dense-weights
-    // loader opens its own readers, so its cache-bypass choice is independent of this one. Opened
-    // before any expert buffer is allocated, because the buffers are aligned to what the readers
-    // learn about the files: the coarsest granule over the shards, and never less than a page.
+    // Pluggable block provider over all shards (auto = Linux io_uring with Posix fallback). Opened
+    // before any expert buffer is allocated, because the buffers are aligned to what the provider
+    // learns about the files: the coarsest granule over the shards, and never less than a page.
     const size_t max_slice = max_full_any / (size_t) n_expert_;
-    buf_align_ = page_;
-    for (const std::string & sp : shard_paths) {
-        readers_.push_back(std::unique_ptr<FileReader>(new FileReader()));
-        if (!readers_.back()->open(sp, io_threads_, cfg.o_direct, max_slice)) return false;
-        buf_align_ = std::max(buf_align_, readers_.back()->buffer_align());
-    }
+    provider_ = open_local_block_provider(shard_paths, io_threads_, cfg.o_direct, max_slice, cfg.io_backend);
+    if (!provider_) return false;
+    buf_align_ = std::max(page_, provider_->buffer_align());
 
     // Auto budget: size the cache to the device once, now that the full expert-set size is known.
     // (validate() guarantees cache_mb == 0 here, so this is the sole source of cache_max_ when auto.)
@@ -266,15 +260,13 @@ bool ExpertStreamSource::init(const std::vector<std::string> & shard_paths,
     // fully direct, and a metadata-only first shard that never carried an expert read must not
     // flatter the shards that do. Settled here, before any worker thread exists; stats() reads it
     // cross-thread for the rest of the run.
-    effective_direct_ = true;
-    for (const auto & r : readers_)
-        effective_direct_ = effective_direct_ && r->direct();
+    effective_direct_ = provider_->direct();
+    const int n_shards = provider_->shard_count();
     for (const LayerExperts & L : layers_) {
         if (!L.bound) continue;
         for (int p = 0; p < ExpertLayout::max_slots; ++p)
-            if (L.proj[p].nb2 && (L.proj[p].file_idx < 0 || L.proj[p].file_idx >= (int) readers_.size())) {
-                log_printf(LogLevel::Error, "expert tensor points at shard %d of %zu", L.proj[p].file_idx,
-                           readers_.size());
+            if (L.proj[p].nb2 && (L.proj[p].file_idx < 0 || L.proj[p].file_idx >= n_shards)) {
+                log_printf(LogLevel::Error, "expert tensor points at shard %d of %d", L.proj[p].file_idx, n_shards);
                 return false;
             }
     }
@@ -295,37 +287,41 @@ bool ExpertStreamSource::init(const std::vector<std::string> & shard_paths,
     // are the complement of the expert ranges in the file, computed once here and shared by the warm
     // sweep and the sensor.
     {
-        std::vector<std::vector<std::pair<uint64_t, uint64_t>>> exp(readers_.size());
+        std::vector<std::vector<std::pair<uint64_t, uint64_t>>> exp((size_t) n_shards);
         for (const LayerExperts & L : layers_) {
             if (!L.bound) continue;
             for (int p = 0; p < ExpertLayout::max_slots; ++p) {
                 const uint64_t sz = (uint64_t) L.proj[p].nb2 * (uint64_t) n_expert_;
-                if (sz) exp[L.proj[p].file_idx].push_back({L.proj[p].file_off, L.proj[p].file_off + sz});
+                if (sz) exp[(size_t) L.proj[p].file_idx].push_back({L.proj[p].file_off, L.proj[p].file_off + sz});
             }
         }
-        std::vector<std::vector<std::pair<uint64_t, uint64_t>>> ranges(readers_.size());
-        for (size_t s = 0; s < readers_.size(); ++s)
-            ranges[s] = DenseWeights::byte_ranges(std::move(exp[s]), readers_[s]->file_size());
+        std::vector<std::vector<std::pair<uint64_t, uint64_t>>> ranges((size_t) n_shards);
+        for (int s = 0; s < n_shards; ++s)
+            ranges[(size_t) s] = DenseWeights::byte_ranges(std::move(exp[(size_t) s]), provider_->shard_size(s));
         dense_.set_row_gathered(std::move(row_tensors_), row_budget_);
         dense_.set_mapped(cfg.dense_mapped);
-        if (!dense_.init(cfg.dense_weights, shard_paths, std::move(ranges), std::move(dense_tensors_))) {
+        if (!dense_.init(cfg.dense_weights, shard_paths, std::move(ranges), std::move(dense_tensors_),
+                         cfg.io_backend)) {
             log_printf(LogLevel::Error, "dense-weights init failed");
             return false;
         }
     }
 
     active_ = true;
-    // Serial: lane 0 is the calling thread (it drains inline), workers own lanes 1..N-1.
-    // Overlap: the caller never drains — every lane 0..N-1 gets a worker so reads proceed
-    // while the compute threads run the FFN and block per expert on the readiness flags.
-    // Lane 0's worker is kept apart from the others, since a switch of mode starts or stops it alone.
-    for (int lane = 1; lane < io_threads_; ++lane)
+    // Serial (Posix): lane 0 is the calling thread (it drains inline), workers own lanes 1..N-1.
+    // Overlap (Posix): every lane 0..N-1 gets a worker.
+    // Batched providers (io_uring): serial load_layer submits all jobs via read_batch() inline and
+    // overlap uses lane0_worker_ for batched submissions; keep at most one auxiliary worker for
+    // serial-mode speculative prefetch when io_threads_ > 1.
+    const int pool_lanes = provider_->prefers_batch() ? (io_threads_ > 1 ? 2 : 1) : io_threads_;
+    for (int lane = 1; lane < pool_lanes; ++lane)
         io_pool_.emplace_back(&ExpertStreamSource::io_worker, this, lane);
     if (overlap_) lane0_worker_ = std::thread(&ExpertStreamSource::io_worker, this, 0);
 
-    // effective_direct_ (set where the readers opened) is the run's o_direct fact — see above.
-    log_printf(LogLevel::Info, "expert streaming ON  n_expert=%d o_direct=%d io_threads=%d cache=%zu MiB shards=%zu",
-               n_expert_, (int) effective_direct_, io_threads_, cache_max_ >> 20, readers_.size());
+    // effective_direct_ (set where the provider opened) is the run's o_direct fact — see above.
+    log_printf(LogLevel::Info,
+               "expert streaming ON  n_expert=%d o_direct=%d io_threads=%d io=%s cache=%zu MiB shards=%d", n_expert_,
+               (int) effective_direct_, io_threads_, provider_->backend_name(), cache_max_ >> 20, n_shards);
     return true;
 }
 
@@ -397,20 +393,18 @@ bool ExpertStreamSource::reopen_readers() {
         log_printf(LogLevel::Error, "reopen_readers refused: reads are queued");
         return false;
     }
-    bool ok = true;
-    for (auto & r : readers_)
-        ok = r->reopen() && ok;
+    const bool ok = provider_ ? provider_->reopen() : true;
     return dense_.reopen_readers() && ok;
 }
 
 // ── one aligned slice read on a lane ────────────────────────────────────────────────
-// The bytes come from the reader; this wraps it with the domain the reader must not know about — the
-// per-read I/O trace that attributes a read to its (layer, expert, projection). Latency is timed here
-// so the row carries this read's own cost, not the reader's running total.
+// The bytes come from the provider; this wraps it with the domain the provider must not know about —
+// the per-read I/O trace that attributes a read to its (layer, expert, projection). Latency is timed
+// here so the row carries this read's own cost, not the provider's running total.
 bool ExpertStreamSource::read_slice(int lane, const IoJob & j) {
     if (j.nbytes == 0) return true;
     const auto t0 = clock_t_::now();
-    const long long window = readers_[(size_t) j.file]->read(lane, j.dst, j.off, j.nbytes);
+    const long long window = provider_->read(lane, j.file, j.dst, j.off, j.nbytes);
     if (window < 0) return false;
 
     if (io_trace_on_) {
@@ -479,8 +473,56 @@ void ExpertStreamSource::io_drain(int lane, uint64_t my_gen) {
     }
 }
 
+void ExpertStreamSource::io_drain_batch(uint64_t my_gen) {
+    for (;;) {
+        batch_jobs_.clear();
+        {
+            std::lock_guard<std::mutex> lk(io_mtx_);
+            if (batch_gen_ != my_gen || next_idx_ >= batch_njobs_) return;
+            batch_jobs_.assign(jobs_.begin() + (ptrdiff_t) next_idx_, jobs_.begin() + (ptrdiff_t) batch_njobs_);
+            next_idx_ = batch_njobs_;
+        }
+        const size_t n = batch_jobs_.size();
+        batch_reqs_.resize(n);
+        for (size_t i = 0; i < n; ++i) {
+            const IoJob & j = batch_jobs_[i];
+            batch_reqs_[i] = BlockReadReq{j.file, j.off, j.nbytes, j.dst, 0, 0};
+        }
+        provider_->read_batch(batch_reqs_.data(), n, [&](size_t i, bool ok) {
+            const IoJob & j = batch_jobs_[i];
+            if (!ok) {
+                io_err_.store(true);
+                if (overlap_) fatal_.store(true, std::memory_order_release);
+            } else if (io_trace_on_ && j.nbytes > 0) {
+                IoTraceRow r;
+                r.layer = j.layer;
+                r.expert = j.expert;
+                r.proj = (int8_t) j.proj;
+                r.lane = 0;
+                r.spec = j.spec;
+                r.offset = j.off;
+                r.req_bytes = j.nbytes;
+                r.read_bytes = (uint64_t) batch_reqs_[i].bytes_moved;
+                r.latency_ns = batch_reqs_[i].latency_ns;
+                std::lock_guard<std::mutex> lk(io_trace_mtx_);
+                io_trace_rows_.push_back(r);
+            }
+            if (j.flag >= 0) {
+                ready_[(size_t) j.flag].gen.store(batch_flag_gen_, std::memory_order_seq_cst);
+                if (ready_waiters_.load(std::memory_order_seq_cst) != 0) {
+                    std::lock_guard<std::mutex> lk(ready_mtx_);
+                    ready_cv_.notify_all();
+                }
+            }
+            std::lock_guard<std::mutex> lk(io_mtx_);
+            if (++done_cnt_ == batch_njobs_) io_cv_done_.notify_all();
+        });
+    }
+}
+
 void ExpertStreamSource::io_worker(int lane) {
     uint64_t seen = 0;
+    const bool batch_aux = provider_->prefers_batch() && lane > 0;
     for (;;) {
         {
             std::unique_lock<std::mutex> lk(io_mtx_);
@@ -488,8 +530,9 @@ void ExpertStreamSource::io_worker(int lane) {
             // two-wave publish): a worker that drained wave one and left has seen == batch_gen_,
             // so the gen comparison alone would never bring it back for wave two.
             io_cv_.wait(lk, [&] {
-                return io_stop_ || (lane == 0 && lane0_stop_) || batch_gen_ > seen || next_idx_ < batch_njobs_ ||
-                       spec_next_ < spec_jobs_.size();
+                if (io_stop_ || (lane == 0 && lane0_stop_)) return true;
+                if (batch_aux) return !overlap_ && spec_next_ < spec_jobs_.size();
+                return batch_gen_ > seen || next_idx_ < batch_njobs_ || spec_next_ < spec_jobs_.size();
             });
             if (io_stop_ || (lane == 0 && lane0_stop_)) return;
         }
@@ -501,10 +544,15 @@ void ExpertStreamSource::io_worker(int lane) {
         if (g > seen) seen = g;
         // Real batch first — it is latency-critical. With nothing (left) to drain this returns
         // on its first lock, so calling it on a spec-only wake costs one mutex round.
-        io_drain(lane, seen);
+        if (!batch_aux) {
+            if (provider_->prefers_batch())
+                io_drain_batch(seen);
+            else
+                io_drain(lane, seen);
+        }
         // Then use spare capacity on queued speculative reads, yielding the moment a real batch
         // arrives (drain_spec bails when batch_gen_ advances past this worker's `seen`).
-        drain_spec(lane, seen);
+        if (!batch_aux || !overlap_) drain_spec(lane, seen);
     }
 }
 
@@ -1508,7 +1556,35 @@ bool ExpertStreamSource::load_layer(int il, const int32_t * ids, int n_ids) {
     const size_t njobs = jobs_.size();
     mgmt_ns_.fetch_add((long long) std::chrono::duration_cast<std::chrono::nanoseconds>(clock_t_::now() - tm0).count());
     const auto t0 = clock_t_::now();
-    if (io_threads_ <= 1 || njobs <= 1) {
+    if (provider_->prefers_batch()) {
+        if (njobs > 0) {
+            batch_reqs_.resize(njobs);
+            for (size_t i = 0; i < njobs; ++i) {
+                const IoJob & j = jobs_[i];
+                batch_reqs_[i] = BlockReadReq{j.file, j.off, j.nbytes, j.dst, 0, 0};
+            }
+            const bool ok = provider_->read_batch(batch_reqs_.data(), njobs);
+            if (io_trace_on_) {
+                std::lock_guard<std::mutex> lk(io_trace_mtx_);
+                for (size_t i = 0; i < njobs; ++i) {
+                    const IoJob & j = jobs_[i];
+                    if (j.nbytes == 0 || batch_reqs_[i].bytes_moved < 0) continue;
+                    IoTraceRow r;
+                    r.layer = j.layer;
+                    r.expert = j.expert;
+                    r.proj = (int8_t) j.proj;
+                    r.lane = 0;
+                    r.spec = j.spec;
+                    r.offset = j.off;
+                    r.req_bytes = j.nbytes;
+                    r.read_bytes = (uint64_t) batch_reqs_[i].bytes_moved;
+                    r.latency_ns = batch_reqs_[i].latency_ns;
+                    io_trace_rows_.push_back(r);
+                }
+            }
+            if (!ok) return false;
+        }
+    } else if (io_threads_ <= 1 || njobs <= 1) {
         for (size_t i = 0; i < njobs; ++i) {
             const IoJob & j = jobs_[i];
             if (!read_slice(0, j)) return false;
@@ -1855,11 +1931,8 @@ bool ExpertStreamSource::enable_overlap_hook() {
 
 IExpertSource::Stats ExpertStreamSource::stats() const {
     Stats s;
-    long long rd_bytes = 0, rd_syscall_ns = 0;
-    for (const auto & r : readers_) {
-        rd_bytes += r->read_bytes();
-        rd_syscall_ns += r->syscall_ns();
-    }
+    const long long rd_bytes = provider_ ? provider_->read_bytes() : 0;
+    const long long rd_syscall_ns = provider_ ? provider_->io_ns() : 0;
     s.read_bytes = (uint64_t) rd_bytes;
     // Serial: read_ns_ is the wall time the caller was blocked in the read phase. Overlap: the
     // caller never blocks, so "I/O time" is instead the summed lane-busy time (the readers' syscall
@@ -1939,7 +2012,7 @@ void ExpertStreamSource::shutdown() {
     dense_.shutdown();
     dense_tensors_.clear();
     row_tensors_.clear();
-    readers_.clear(); // closes every shard's lane fds and frees the bounces
+    provider_.reset(); // closes every shard's descriptors and frees bounce buffers / ring
     jobs_.clear();
     layers_.clear();
     active_ = false;
