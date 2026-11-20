@@ -127,7 +127,7 @@ int main() {
         expect_ok("device_cache_cpu_share with a device cache", c);
         RunConfig streamed = c;
         streamed.moe.enabled = true;
-        expect_fail("device_cache_cpu_share over streamed experts (not gated)", streamed);
+        expect_ok("device_cache_cpu_share over streamed experts", streamed);
         c.moe.device_cache_cpu_share = MoeStreamConfig::device_cache_cpu_share_max + 0.5f;
         expect_fail("device_cache_cpu_share above 1", c);
         c.moe.device_cache_cpu_share = -0.1f;

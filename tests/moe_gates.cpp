@@ -84,9 +84,11 @@
 //       A load with the width's trade and no side timed records its requests, no rate (g).
 //   G25 the device tier: llama.cpp's device-side expert cache over resident experts (a), over
 //       streamed experts (b) and streamed under n-gram speculation (c), and over resident experts
-//       with half the cache's misses computed on the host (d), each == the resident placement; and
+//       with half the cache's misses computed on the host (d), each == the resident placement;
 //       each side of the device tier timed for a decision across loads (e), with its rate in the
-//       record.
+//       record; and on a discrete GPU (CUDA), streamed experts + device cache + cpu_share=0.5
+//       across wide prefill (>32 tokens) and decode == unstreamed reference with zero flash
+//       double-reads on VRAM hits (f).
 //   G26 the real-layer probe fills every device's facts and agrees with the host on the layer's
 //       matmuls; it is timed, not gated, on the tiny models.
 //   G28 the answer check of a model held whole on a device (KnobTrialConfig::answer_device): answers
@@ -236,6 +238,23 @@ static std::string loopback_rpc_device() {
     if (!srv || ggml_backend_reg_dev_count(srv) == 0) return "";
     ggml_backend_register(srv);
     return ggml_backend_dev_name(ggml_backend_reg_dev_get(srv, 0));
+}
+
+// Find a real discrete GPU device (preferring CUDA), skipping CPU and RPC devices.
+static std::string discrete_gpu_device() {
+    std::string fallback;
+    for (size_t i = 0; i < ggml_backend_dev_count(); ++i) {
+        ggml_backend_dev_t dev = ggml_backend_dev_get(i);
+        if (!dev) continue;
+        if (ggml_backend_dev_type(dev) != GGML_BACKEND_DEVICE_TYPE_GPU) continue;
+        ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(dev);
+        const char * rname = reg ? ggml_backend_reg_name(reg) : "";
+        if (std::string(rname) == "RPC") continue;
+        const std::string name = ggml_backend_dev_name(dev);
+        if (std::string(rname) == "CUDA") return name;
+        if (fallback.empty()) fallback = name;
+    }
+    return fallback;
 }
 
 // Whether the model's trunk has two adjacent MoE blocks, read from the file: a MoE block is one
@@ -1972,6 +1991,195 @@ int main(int argc, char ** argv) {
                 }
                 fails +=
                     check("G20b device routing, streamed experts, overlap == resident experts", s_placed, s_placed_ov);
+            }
+        }
+    }
+
+    // ── G25f: discrete GPU hybrid device cache + streamed experts + cpu_share=0.5 ────────────────
+    // Runs on a real discrete GPU (CUDA) when present:
+    //   1. Wide prefill (n_tokens > 32, exercising sched_copy_experts) + decode with a small VRAM
+    //      cache (4 MiB, forcing VRAM hits + evictions) and device_cache_cpu_share = 0.5 must be
+    //      byte- and logit-identical to the unstreamed reference with the same placement, both with
+    //      routing recording off (zero Split A barriers) and on (unbiased recording).
+    //   2. Zero flash double-reads on VRAM hits: with a tiny host RAM cache (1 MiB) strictly smaller
+    //      than the VRAM cache (32 MiB), a repeated generation hitting the warm VRAM cache must
+    //      perform exactly 0 bytes of flash reads across prefill and decode.
+    {
+        const std::string gpu = discrete_gpu_device();
+        if (gpu.empty()) {
+            std::printf("[SKIP] G25f hybrid GPU device cache: no discrete GPU backend available\n");
+        } else {
+            struct LogprobReadSink : IMetricsSink {
+                std::vector<float> logprobs;
+                std::vector<std::vector<TokenLogprob>> top_logprobs;
+                uint64_t decode_read_bytes = 0;
+                void on_token(const TokenMetrics & m) override {
+                    logprobs.push_back(m.logprob);
+                    top_logprobs.push_back(m.top_logprobs);
+                    decode_read_bytes += m.read_bytes;
+                }
+                void on_summary(const RunSummary &) override {}
+            };
+
+            // Offload every repeating layer plus the output layer so every MoE layer is
+            // managed by llama_moe_cache on the GPU.
+            const int n_offload = read_gguf_model_info(model.c_str()).n_block + 1;
+            const std::string wide_prompt =
+                "Hello world, this is a streaming test for hybrid GPU and CPU MoE cache execution.";
+
+            auto make_gpu_cfg = [&](bool streamed, int dev_cache_mb, float cpu_share, int host_cache_mb,
+                                    int rec_tokens) {
+                RunConfig c = base(model);
+                c.n_ctx = 512;
+                c.n_ubatch = 256;
+                c.n_predict = 24;
+                c.prompt = wide_prompt;
+                c.n_gpu_layers = n_offload;
+                c.device_split = {{gpu, n_offload}};
+                c.buft_overrides = {"\\.ffn_(up|down|gate|gate_up)_(ch|)exps"};
+                c.moe.enabled = streamed;
+                c.moe.cache_mb = host_cache_mb;
+                c.moe.force_cache = host_cache_mb > 0;
+                c.moe.device_cache_mb = dev_cache_mb;
+                c.moe.device_cache_cpu_share = cpu_share;
+                c.moe.routing_record_tokens = rec_tokens;
+                return c;
+            };
+
+            // (1) Exact token + logit byte-identity across wide prefill (>32 tokens) & decode
+            //     with VRAM evictions + hits + cpu_share = 0.5.
+            const RunConfig ref_cfg = make_gpu_cfg(false, 4, 0.5f, 0, 0);
+            const RunConfig str_cfg = make_gpu_cfg(true, 4, 0.5f, 1, 0);
+            const RunConfig rec_cfg = make_gpu_cfg(true, 4, 0.5f, 1, 256);
+
+            auto run_with_logprobs = [&](const RunConfig & c, RunResult & out_res, LogprobReadSink & sink,
+                                         size_t * rec_batches = nullptr) -> bool {
+                std::unique_ptr<Session> s = Session::open(session_config_from(c), err);
+                if (!s) return false;
+                GenerateRequest req;
+                req.prompt = c.prompt;
+                req.n_predict = c.n_predict;
+                req.clear_kv = true;
+                req.n_probs = 4;
+                out_res = s->generate(req, nullptr, &sink);
+                if (!out_res) {
+                    err = out_res.error;
+                    return false;
+                }
+                if (rec_batches) *rec_batches = s->routing_record().batches.size();
+                return true;
+            };
+
+            RunResult r_ref, r_str, r_rec;
+            LogprobReadSink sink_ref, sink_str, sink_rec;
+            size_t rec_batches = 0;
+            if (!run_with_logprobs(ref_cfg, r_ref, sink_ref) || !run_with_logprobs(str_cfg, r_str, sink_str) ||
+                !run_with_logprobs(rec_cfg, r_rec, sink_rec, &rec_batches)) {
+                std::printf("[FAIL] G25f hybrid GPU run failed (%s): %s\n", gpu.c_str(), err.c_str());
+                ++fails;
+            } else {
+                if (r_str.summary.n_prompt <= 32) {
+                    std::printf("[FAIL] G25f wide prefill expected >32 prompt tokens, got %d\n",
+                                r_str.summary.n_prompt);
+                    ++fails;
+                } else {
+                    std::printf("[PASS] G25f wide prefill exercised sched_copy_experts (%s, n_prompt=%d)\n",
+                                gpu.c_str(), r_str.summary.n_prompt);
+                }
+                fails += check("G25f streamed + device cache (4 MiB) + cpu_share=0.5 == unstreamed reference",
+                               r_ref.generated_text, r_str.generated_text);
+                fails += check("G25f same with routing recorder armed == unstreamed reference", r_ref.generated_text,
+                               r_rec.generated_text);
+                if (rec_batches == 0) {
+                    std::printf("[FAIL] G25f routing recorder captured 0 batches while armed\n");
+                    ++fails;
+                } else {
+                    std::printf("[PASS] G25f routing recorder remained active (%zu batches recorded)\n", rec_batches);
+                }
+                bool logits_match = (sink_ref.logprobs.size() == sink_str.logprobs.size() &&
+                                     sink_ref.top_logprobs.size() == sink_str.top_logprobs.size() &&
+                                     !sink_ref.logprobs.empty());
+                for (size_t i = 0; logits_match && i < sink_ref.logprobs.size(); ++i) {
+                    if (sink_ref.logprobs[i] != sink_str.logprobs[i]) logits_match = false;
+                    const auto & a = sink_ref.top_logprobs[i];
+                    const auto & b = sink_str.top_logprobs[i];
+                    if (a.size() != b.size()) logits_match = false;
+                    for (size_t j = 0; logits_match && j < a.size(); ++j) {
+                        if (a[j].id != b[j].id || a[j].logprob != b[j].logprob) logits_match = false;
+                    }
+                }
+                if (!logits_match) {
+                    std::printf("[FAIL] G25f per-token top-4 logprobs diverged between streamed and unstreamed (%s)\n",
+                                gpu.c_str());
+                    ++fails;
+                } else {
+                    std::printf("[PASS] G25f exact per-token logit/logprob byte-identity across %zu tokens (%s)\n",
+                                sink_str.logprobs.size(), gpu.c_str());
+                }
+                const double hybrid_read_mib = r_str.summary.prefill_read_mib + r_str.summary.moe_read_mib;
+                if (!(hybrid_read_mib > 0.0)) {
+                    std::printf("[FAIL] G25f hybrid streamed run reported 0 MiB read\n");
+                    ++fails;
+                } else {
+                    std::printf("[PASS] G25f hybrid streamed run read %.3f MiB (prefill=%.3f MiB, decode=%.3f MiB / "
+                                "%llu B, host evictions=%lld)\n",
+                                hybrid_read_mib, r_str.summary.prefill_read_mib, r_str.summary.moe_read_mib,
+                                (unsigned long long) sink_str.decode_read_bytes, r_str.summary.cache_evictions);
+                }
+            }
+
+            // (2) Zero flash double-reads on VRAM hits:
+            //     Host RAM cache (1 MiB) is strictly smaller than VRAM cache (32 MiB) and smaller
+            //     than the tiny model's routed expert working set, so Turn 1 evicts host-RAM entries
+            //     while VRAM retains every expert. Use a prompt <= 32 tokens so both prefill and
+            //     decode populate VRAM via llama_moe_cache::copy(); Turn 2 repeats the exact same
+            //     prompt+decode with clear_kv=true and MUST perform 0 bytes of flash reads.
+            RunConfig hit_cfg = make_gpu_cfg(true, 32, 0.5f, 1, 0);
+            hit_cfg.prompt = "Hello world!";
+            hit_cfg.n_predict = 16;
+            std::unique_ptr<Session> s_hit = Session::open(session_config_from(hit_cfg), err);
+            if (!s_hit) {
+                std::printf("[FAIL] G25f zero-double-read session failed to open (%s): %s\n", gpu.c_str(),
+                            err.c_str());
+                ++fails;
+            } else {
+                GenerateRequest req;
+                req.prompt = hit_cfg.prompt;
+                req.n_predict = hit_cfg.n_predict;
+                req.clear_kv = true;
+                req.n_probs = 4;
+
+                LogprobReadSink s1, s2;
+                const RunResult r1 = s_hit->generate(req, nullptr, &s1);
+                const RunResult r2 = s_hit->generate(req, nullptr, &s2);
+                if (!r1 || !r2) {
+                    std::printf("[FAIL] G25f zero-double-read generate failed: %s\n",
+                                !r1 ? r1.error.c_str() : r2.error.c_str());
+                    ++fails;
+                } else {
+                    fails += check("G25f warm VRAM turn2 == cold VRAM turn1", r1.generated_text, r2.generated_text);
+                    const double t1_total = r1.summary.prefill_read_mib + r1.summary.moe_read_mib;
+                    const double t2_total = r2.summary.prefill_read_mib + r2.summary.moe_read_mib;
+                    const bool cold_read_ok = t1_total > 0.0;
+                    const bool warm_zero_ok = r2.summary.prefill_read_mib == 0.0 && r2.summary.moe_read_mib == 0.0 &&
+                                              s2.decode_read_bytes == 0;
+                    if (!cold_read_ok || !warm_zero_ok) {
+                        std::printf("[FAIL] G25f zero flash double-reads on VRAM hits (%s, host=1 MiB, vram=32 MiB): "
+                                    "turn1=%.3f MiB (prefill=%.3f, decode=%.3f / %llu B, evict=%lld), "
+                                    "turn2=%.3f MiB (prefill=%.3f, decode=%.3f / %llu B)\n",
+                                    gpu.c_str(), t1_total, r1.summary.prefill_read_mib, r1.summary.moe_read_mib,
+                                    (unsigned long long) s1.decode_read_bytes, r1.summary.cache_evictions, t2_total,
+                                    r2.summary.prefill_read_mib, r2.summary.moe_read_mib,
+                                    (unsigned long long) s2.decode_read_bytes);
+                        ++fails;
+                    } else {
+                        std::printf("[PASS] G25f zero flash double-reads on VRAM hits (%s, host=1 MiB < vram=32 MiB): "
+                                    "turn1=%.3f MiB (prefill=%.3f, decode=%.3f / %llu B, evict=%lld) -> "
+                                    "turn2=0.000 MiB (prefill=0.000, decode=0.000 / 0 B)\n",
+                                    gpu.c_str(), t1_total, r1.summary.prefill_read_mib, r1.summary.moe_read_mib,
+                                    (unsigned long long) s1.decode_read_bytes, r1.summary.cache_evictions);
+                    }
+                }
             }
         }
     }

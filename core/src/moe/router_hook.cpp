@@ -1464,21 +1464,27 @@ void RouterHook::on_topk(ggml_tensor * t, int il) {
     // Open the layer for the drop policy. Deferring the load is only safe once this layer's
     // terminal weight node is known — otherwise there is no callback left to decide in, and the
     // expert matmul would run against slots nothing loaded. First graph of a run: load here.
-    const bool defer = on_host && drop_armed() && il >= 0 && il < (int) term_variant_.size() && term_variant_[il] >= 0;
-    drop_.layer = il;
-    drop_.nu = nu;
-    drop_.nt = nt;
-    drop_.ids = t;
-    drop_.deferred = defer;
-    chain_last_ = -1;
-    if (defer) {
-        drop_ids_ = gathered_;
-    } else {
-        source_->load_layer(il, gathered_.data(), (int) gathered_.size());
-        // Deferred layers speculate from apply_drop instead — after THEIR load, for the same
-        // reason this call sits after the one above: the load's quiesce would cancel it.
-        predict_after_load(il);
-        route_ahead_collect(il);
+    // When llama_moe_cache owns this (layer, batch), moe_cache_miss_cb loads only the VRAM misses
+    // directly from llama.cpp's copy callback — skip loading here to avoid double-reading VRAM hits.
+    const bool cache_handled = device_cache_handles(il, nu, nt);
+    if (!cache_handled) {
+        const bool defer =
+            on_host && drop_armed() && il >= 0 && il < (int) term_variant_.size() && term_variant_[il] >= 0;
+        drop_.layer = il;
+        drop_.nu = nu;
+        drop_.nt = nt;
+        drop_.ids = t;
+        drop_.deferred = defer;
+        chain_last_ = -1;
+        if (defer) {
+            drop_ids_ = gathered_;
+        } else {
+            source_->load_layer(il, gathered_.data(), (int) gathered_.size());
+            // Deferred layers speculate from apply_drop instead — after THEIR load, for the same
+            // reason this call sits after the one above: the load's quiesce would cancel it.
+            predict_after_load(il);
+            route_ahead_collect(il);
+        }
     }
 
     // Score the predictors against the routing the router just produced — before the record
@@ -1489,11 +1495,12 @@ void RouterHook::on_topk(ggml_tensor * t, int il) {
         score_layer(il, gathered_.data() + (size_t) (nt - 1) * nu, nu);
 
     // Temporal prefetch: hint the next K layers with what the PREVIOUS token routed there,
-    // to be read on idle lanes while this layer computes.
+    // to be read on idle lanes while this layer computes. Skip target layers backed by the
+    // device expert cache so prefetch never re-reads VRAM-resident experts from flash.
     if (prefetch_layers_ > 0 && il >= 0 && il < n_layer_) {
         for (int k = 1; k <= prefetch_layers_; ++k) {
             const int tl = il + k;
-            if (tl < n_layer_ && !prev_ids_[tl].empty())
+            if (tl < n_layer_ && !device_cache_layer_cached(tl) && !prev_ids_[tl].empty())
                 source_->prefetch(tl, prev_ids_[tl].data(), (int) prev_ids_[tl].size());
         }
     }
@@ -1599,7 +1606,26 @@ bool RouterHook::on_eval(ggml_tensor * t, bool ask) {
         // route_ahead_submit plus the passthrough default, not a barrier.
         // Without a streamer the routing nodes are wanted only while the routing record is still
         // open: each is a barrier, and once the record is full a run that does not stream pays none.
-        const bool want_topk = is_topk && (source_ || recording());
+        // When llama_moe_cache owns this layer/batch, moe_cache_miss_cb loads only VRAM misses from
+        // llama.cpp's copy callback — skip isolating ffn_moe_topk-<il> unless an observer or host
+        // routing policy still requires the full routing, letting GPU and CPU splits run async.
+        const bool cache_handled = is_topk && source_ && device_cache_handles(il, t->ne[0], t->ne[1]);
+        bool prefetch_needs_topk = false;
+        if (cache_handled && prefetch_layers_ > 0 && il >= 0 && il < n_layer_) {
+            for (int k = 1; k <= prefetch_layers_; ++k) {
+                const int tl = il + k;
+                if (tl < n_layer_ && !device_cache_layer_cached(tl)) {
+                    prefetch_needs_topk = true;
+                    break;
+                }
+            }
+        }
+        const bool host_policy_needs_topk = drop_armed() || substitute_armed() || route_ahead_ > 0 || predict_prefetch_;
+        const bool observer_needs_topk = trace_on_ || rec_on_ || predict_log_;
+        const bool want_topk =
+            is_topk && ((source_ && (!cache_handled || observer_needs_topk || host_policy_needs_topk ||
+                                     prefetch_needs_topk)) ||
+                        (!source_ && recording()));
         return ctrace_iso || want_topk || weights_iso || (is_logits && predict_log_) || probe_ask;
     }
 

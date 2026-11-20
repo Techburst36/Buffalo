@@ -621,7 +621,10 @@ struct Session::Impl {
         // buffers back the rebound expert tensors), then the context (its eval callback points
         // at the hook), then the hook, then unmap the model, then release the backend. The hook's
         // prediction worker goes first of all: it reads gate weights the source frees.
-        if (hook) hook->predict_worker_stop();
+        if (hook) {
+            hook->predict_worker_stop();
+            hook->clear_device_cache();
+        }
         source.shutdown();
         // Hands every weight back to its mapping, then frees the device copy: before the model goes.
         prefill.reset();
@@ -1347,6 +1350,16 @@ bool Session::Impl::build_hook(Opening & o) {
     return true;
 }
 
+// Trampolines bridging llama.cpp's MoE device-cache C callbacks to the streamer and router hook.
+static void on_moe_cache_miss(int32_t il, const int32_t * experts, int32_t n_experts, void * user_data) {
+    if (n_experts <= 0 || !experts || !user_data) return;
+    static_cast<ExpertStreamSource *>(user_data)->load_layer(il, experts, n_experts);
+}
+
+static bool device_cache_handles_batch(const void * ctx, int32_t il, int64_t n_tokens, int64_t n_expert_used) {
+    return llama_moe_cache_handles_batch(static_cast<const llama_context *>(ctx), il, n_tokens, n_expert_used);
+}
+
 // The target context, and the MTP draft context beside it when speculation drafts from the head.
 bool Session::Impl::create_contexts(Opening & o) {
     const SessionConfig & cfg = o.cfg;
@@ -1403,6 +1416,12 @@ bool Session::Impl::create_contexts(Opening & o) {
     // same tensors the streamer serves, so the CPU half reads what the slots would have been filled
     // from (docs/seam.md).
     if (device_cache_armed) cparams.moe_cache_cpu_share = cfg.moe.device_cache_cpu_share;
+    // Route VRAM misses directly from llama_moe_cache::copy() / sched_copy_experts() to the
+    // streamer so VRAM hits never trigger flash reads or Split A barriers.
+    if (device_cache_armed && cfg.moe.enabled) {
+        cparams.moe_cache_miss_cb = &on_moe_cache_miss;
+        cparams.moe_cache_miss_cb_user_data = &source;
+    }
 
     llama_context * c = llama_init_from_model(model.get(), cparams);
     // The device cache is sized from what the capacity fitter left free, and the fitter measured a
@@ -1457,6 +1476,18 @@ bool Session::Impl::create_contexts(Opening & o) {
     }
     if (!c) return o.fail("failed to create context"); // llama.cpp's own log says why
     ctx.reset(c);
+    if (hook) {
+        if (device_cache_armed && cfg.moe.enabled) {
+            // Only trunk layers [0, n_layer) belong to ctx; MTP layers [n_layer, ...) run on ctx_dft
+            // which has no device cache and must keep loading through RouterHook::on_topk.
+            std::vector<uint8_t> cached((size_t) n_layer, (uint8_t) 0);
+            for (int il = 0; il < n_layer; ++il)
+                cached[(size_t) il] = llama_moe_cache_layer_cached(c, il) ? 1 : 0;
+            hook->set_device_cache(c, &device_cache_handles_batch, std::move(cached));
+        } else {
+            hook->clear_device_cache();
+        }
+    }
     // Decode and prefill get their own counts. They are different workloads: prefill is compute-bound
     // and scales with cores, a streamed decode waits on flash. 0 means "the same", which is what
     // every caller got before this existed.
@@ -1472,6 +1503,8 @@ bool Session::Impl::create_contexts(Opening & o) {
         // One device cache, the target's: the draft's own expert layer is served from the host, and a
         // second cache would take as much device memory again for a head that routes one position.
         dparams.moe_cache_size = 0;
+        dparams.moe_cache_miss_cb = nullptr;
+        dparams.moe_cache_miss_cb_user_data = nullptr;
         dparams.n_rs_seq = 0;
         // The target's output cap is about the target's logits; the draft keeps llama.cpp's own,
         // which its narrow ubatch below already bounds.
@@ -1862,6 +1895,7 @@ bool Session::Impl::arm_device_cache(Opening & o) {
     const bool had_mtp = mtp != nullptr;
     mtp.reset();
     ctx_dft.reset();
+    if (hook) hook->clear_device_cache();
     ctx.reset();
     device_cache_armed = true;
     if (!create_contexts(o)) return false;

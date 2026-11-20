@@ -130,6 +130,21 @@ public:
 
     void set_source(IExpertSource * src) { source_ = src; } // non-null → stream mode
 
+    // Device-side expert cache metadata (llama_moe_cache): when active for a layer and batch,
+    // llama.cpp invokes moe_cache_miss_cb for only the VRAM misses, so on_topk skips loading
+    // (and skips isolating ffn_moe_topk-<il> when no observer or host policy needs it).
+    using DeviceCacheBatchFn = bool (*)(const void * ctx, int32_t il, int64_t n_tokens, int64_t n_expert_used);
+    void set_device_cache(const void * ctx, DeviceCacheBatchFn handles_batch, std::vector<uint8_t> layer_cached) {
+        dc_ctx_ = ctx;
+        dc_handles_batch_ = handles_batch;
+        dc_layer_cached_ = std::move(layer_cached);
+    }
+    void clear_device_cache() {
+        dc_ctx_ = nullptr;
+        dc_handles_batch_ = nullptr;
+        dc_layer_cached_.clear();
+    }
+
     // Install the row-gathered residency policy (see bmoe/row_source.h). Non-null makes the stream
     // pass check every gather node against it and make the rows present before the node runs.
     void set_row_source(IRowSource * src) { row_source_ = src; }
@@ -364,6 +379,16 @@ private:
     bool capturing_ = false;
     IExpertSource * source_ = nullptr;  // non-null → stream mode
     IRowSource * row_source_ = nullptr; // row-gathered dense tables, when the policy is on
+    const void * dc_ctx_ = nullptr;
+    DeviceCacheBatchFn dc_handles_batch_ = nullptr;
+    std::vector<uint8_t> dc_layer_cached_;
+    bool device_cache_layer_cached(int il) const {
+        return il >= 0 && il < (int) dc_layer_cached_.size() && dc_layer_cached_[(size_t) il] != 0;
+    }
+    bool device_cache_handles(int il, int64_t nu, int64_t nt) const {
+        return dc_ctx_ && dc_handles_batch_ && device_cache_layer_cached(il) &&
+               dc_handles_batch_(dc_ctx_, il, nt, nu);
+    }
     std::vector<LayerExperts> captured_;
     std::unordered_map<std::string, ggml_tensor *> captured_weights_;
     std::vector<ggml_tensor *> captured_weight_objects_; // same leaves, deduplicated by address
