@@ -215,6 +215,9 @@ int main() {
     expect_flag({"--release-mmap"}, [](const RunConfig & c) { return c.moe.release_mmap; });
     expect_flag({"--row-stream"}, [](const RunConfig & c) { return c.moe.row_stream; });
     expect_flag({"--row-stream-mb", "32"}, [](const RunConfig & c) { return c.moe.row_stream_mb == 32; });
+    expect_flag({"--dense-stream"}, [](const RunConfig & c) { return c.moe.dense_stream; });
+    expect_flag({"--dense-cache-mb", "6"}, [](const RunConfig & c) { return c.moe.dense_cache_mb == 6; });
+    expect_flag({"--dense-min-bytes", "16384"}, [](const RunConfig & c) { return c.moe.dense_min_bytes == 16384; });
     expect_flag({"--dense-weights", "mmap"},
                 [](const RunConfig & c) { return c.moe.dense_weights == DenseWeightsMode::Mmap; });
     expect_flag({"--dense-weights", "warm"},

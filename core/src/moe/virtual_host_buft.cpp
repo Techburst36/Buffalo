@@ -84,7 +84,19 @@ ggml_backend_buffer_t vhost_buft_alloc_buffer(ggml_backend_buffer_type_t buft, s
 }
 
 size_t vhost_buft_get_alignment(ggml_backend_buffer_type_t) {
-    return ggml_backend_buft_get_alignment(ggml_backend_cpu_buffer_type());
+    // Place every tensor on its own OS page boundary so pio::vm_evict() on one streamed tensor
+    // can never touch or zero a neighboring tensor's page.
+    const size_t cpu_align = ggml_backend_buft_get_alignment(ggml_backend_cpu_buffer_type());
+    const size_t page = pio::vm_page();
+    return page > cpu_align ? page : cpu_align;
+}
+
+size_t vhost_buft_get_alloc_size(ggml_backend_buffer_type_t buft, const ggml_tensor * tensor) {
+    const size_t nbytes = ggml_nbytes(tensor);
+    if (nbytes == 0) return 0;
+    const size_t align = vhost_buft_get_alignment(buft);
+    const size_t need = nbytes + pio::tensor_tail_slack();
+    return ((need + align - 1) / align) * align;
 }
 
 bool vhost_buft_is_host(ggml_backend_buffer_type_t) {
@@ -101,7 +113,7 @@ ggml_backend_buffer_type_t bmoe_virtual_host_buffer_type() {
             /* .alloc_buffer_n   = */ nullptr,
             /* .get_alignment    = */ vhost_buft_get_alignment,
             /* .get_max_size     = */ nullptr,
-            /* .get_alloc_size   = */ nullptr,
+            /* .get_alloc_size   = */ vhost_buft_get_alloc_size,
             /* .get_alloc_size_n = */ nullptr,
             /* .is_host          = */ vhost_buft_is_host,
         },

@@ -47,6 +47,7 @@ if(BMOE_HAVE_LLAMA)
         src/io/mapping_release.cpp
         src/io/parallel_copy.cpp
         src/moe/dense_weights.cpp
+        src/moe/dense_stream_source.cpp
         src/moe/row_stream.cpp
         src/moe/gguf_offsets.cpp
         src/moe/virtual_host_buft.cpp

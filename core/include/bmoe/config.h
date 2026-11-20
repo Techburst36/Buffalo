@@ -237,6 +237,22 @@ struct MoeStreamConfig {
     //             and the policy the Android app ships by default — the CLI matches it here.
     DenseWeightsMode dense_weights = DenseWeightsMode::Anonymous;
 
+    // ── layer-wise dense weight streaming (pure dense models & MoE dense layers) ─────
+    // Stream host-resident dense tensors (attention, dense FFNs, shared experts, SSM, output head)
+    // on demand over any BlockProvider (Posix, io_uring, or HTTP Range) inside a bounded RAM
+    // window, evicting finished layers via pio::vm_evict() and prefetching the next layer
+    // asynchronously. Works on pure dense models (n_expert <= 1) as well as MoE models (with or
+    // without --moe-stream). Opt-in; off by default.
+    bool dense_stream = false;
+    // Bounded RAM window for streamed dense groups in MiB. 0 (auto) uses the minimal 2-layer
+    // look-ahead window (sum of the two largest streamed groups). An explicit value caps resident
+    // streamed dense bytes via LRU eviction, always permitting the active pinned group to finish.
+    int dense_cache_mb = 0;
+    // Minimum tensor byte size eligible for dense streaming; smaller host tensors (1-D norms,
+    // biases, router gates, RoPE freqs) stay permanently resident in RAM.
+    static constexpr int dense_min_bytes_default = 65536; // 64 KiB
+    int dense_min_bytes = dense_min_bytes_default;
+
     // ── row-gathered dense tables served from flash (see bmoe/row_source.h) ──────────
     // A dense weight the graph only ever GATHERS ROWS from — a token embedding table is the pure
     // case — is resident for nothing: one row of it is read per decoded token and the rest of the

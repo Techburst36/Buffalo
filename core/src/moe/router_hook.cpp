@@ -4,11 +4,13 @@
 #include "ggml-backend.h"
 #include "ggml.h"
 #include "decide_probe.h"
+#include "dense_stream_source.h"
 #include "gate_gemv.h"
 #include "device_arena.h"
 #include "tensor_names.h"
 #include "../io/platform_io.h"
 
+#include <algorithm>
 #include <cmath>
 #include <cstdio>
 #include <cstring>
@@ -1517,6 +1519,11 @@ void RouterHook::on_topk(ggml_tensor * t, int il) {
     }
 }
 
+void RouterHook::end_dense_batch() {
+    dense_active_.clear();
+    if (dense_source_) dense_source_->unpin_all();
+}
+
 bool RouterHook::on_eval(ggml_tensor * t, bool ask) {
     // The scheduler asks about every node of every split, whichever backend runs it.
     if (ask && count_device_nodes_ && t->buffer && !ggml_backend_buffer_is_host(t->buffer)) ++device_nodes_;
@@ -1539,6 +1546,37 @@ bool RouterHook::on_eval(ggml_tensor * t, bool ask) {
     if (device_arena_) return arena_eval(t, ask, probe_ask);
 
     if (row_source_ && ask) serve_rows(t);
+
+    // ── layer-wise dense weight streaming (--dense-stream) ──
+    // On ask == true: before ggml executes node `t`, pin every streamed dense group referenced
+    // by `t`'s inputs (walking view_src chains to weight leaves) and enqueue async look-ahead for
+    // the next group in forward order. Isolate layer-end nodes (`last_node_[nl]`) and non-block
+    // nodes (token_embd / output.weight) so ask == false runs right after compute synchronizes.
+    bool dense_iso = false;
+    const bool dense_on = dense_source_ && dense_source_->active();
+    if (dense_on && ask) {
+        for (int s = 0; s < GGML_MAX_SRC; ++s) {
+            ggml_tensor * leaf = t->src[s];
+            if (!leaf) continue;
+            while (leaf->view_src)
+                leaf = leaf->view_src;
+            const int g = dense_source_->group_of(leaf);
+            if (g < 0) continue;
+            if (std::find(dense_active_.begin(), dense_active_.end(), g) == dense_active_.end()) {
+                dense_source_->ensure_group_pinned(g);
+                dense_active_.push_back(g);
+                const int next_g = dense_source_->next_group_after(g, t->op == GGML_OP_GET_ROWS);
+                if (next_g >= 0) dense_source_->prefetch_group_async(next_g);
+            }
+            if (g >= dense_source_->n_layer()) dense_iso = true;
+        }
+        const int nl = tn::any_node_layer(t->name);
+        if (nl >= 0 && nl < (int) last_node_.size() && !last_node_[(size_t) nl].empty() &&
+            last_node_[(size_t) nl] == t->name &&
+            std::find(dense_active_.begin(), dense_active_.end(), nl) != dense_active_.end()) {
+            dense_iso = true;
+        }
+    }
 
     // ── stream: the routing nodes get the single-node barrier so we see the selected ids ──
     // One prefix test decides whether any of the three matchers below can possibly fire. The vast
@@ -1626,7 +1664,37 @@ bool RouterHook::on_eval(ggml_tensor * t, bool ask) {
             is_topk && ((source_ && (!cache_handled || observer_needs_topk || host_policy_needs_topk ||
                                      prefetch_needs_topk)) ||
                         (!source_ && recording()));
-        return ctrace_iso || want_topk || weights_iso || (is_logits && predict_log_) || probe_ask;
+        return ctrace_iso || want_topk || weights_iso || (is_logits && predict_log_) || probe_ask || dense_iso;
+    }
+
+    // ── dense stream post-compute unpin & look-ahead ──
+    // ggml_backend_synchronize() has just finished for the segment ending at `t`. Unpin any
+    // non-block group and any block layer whose final node (or a later layer) has completed,
+    // immediately enforcing the RAM budget and prefetching the next group.
+    if (dense_on && !dense_active_.empty()) {
+        const int nl = tn::any_node_layer(t->name);
+        const bool is_embd_gather = t->op == GGML_OP_GET_ROWS;
+        int last_finished = -1;
+        size_t keep = 0;
+        for (size_t i = 0; i < dense_active_.size(); ++i) {
+            const int g = dense_active_[i];
+            const bool is_non_block = g >= dense_source_->n_layer();
+            const bool block_done = !is_non_block &&
+                                    ((g < (int) last_node_.size() && !last_node_[(size_t) g].empty() &&
+                                      last_node_[(size_t) g] == t->name) ||
+                                     (nl >= 0 && nl > g));
+            if (is_non_block || block_done) {
+                dense_source_->unpin_group(g);
+                last_finished = g;
+            } else {
+                dense_active_[keep++] = g;
+            }
+        }
+        dense_active_.resize(keep);
+        if (last_finished >= 0) {
+            const int next_g = dense_source_->next_group_after(last_finished, is_embd_gather);
+            if (next_g >= 0) dense_source_->prefetch_group_async(next_g);
+        }
     }
 
     // The probe attaches to the gate matmul rather than to the topk node because this is where the

@@ -825,6 +825,43 @@ std::vector<ParamDesc> build() {
         t.push_back(d);
     }
     {
+        ParamDesc d = row("dense-stream", "Dense weight streaming", G::Streaming, L::Advanced,
+                          "Stream host-resident dense weights (attention, dense FFNs, shared experts, SSM, output "
+                          "head) layer by layer from storage or HTTP inside a bounded RAM budget, with async "
+                          "1-layer look-ahead. Works on pure dense models and MoE models.");
+        d.type = ParamType::Bool;
+        d.flag.clear();
+        d.switches = {{"--dense-stream", "true"}};
+        bind_bool(d, [](RunConfig & c) -> bool & { return c.moe.dense_stream; });
+        d.details = "On, large host dense weights are streamed layer by layer and evicted after use instead of "
+                    "staying permanently resident in RAM.";
+        t.push_back(d);
+    }
+    {
+        ParamDesc d = row("dense-cache-mb", "Dense stream cache", G::Cache, L::Advanced,
+                          "RAM window in MiB for --dense-stream. 0 (the default) uses the automatic 2-layer "
+                          "look-ahead window; a positive value caps resident streamed dense weights via LRU "
+                          "eviction.");
+        d.value_hint = "N";
+        at_least(d, 0, "MiB");
+        special(d, "0", "auto (2-layer window)");
+        bind_int(d, [](RunConfig & c) -> int & { return c.moe.dense_cache_mb; });
+        d.details = "Maximum RAM held by streamed dense layers before older layers are evicted. 0 sizes the window "
+                    "automatically to hold two layers for async look-ahead.";
+        t.push_back(d);
+    }
+    {
+        ParamDesc d = row("dense-min-bytes", "Dense stream minimum tensor size", G::Memory, L::Advanced,
+                          "Minimum tensor byte size streamed by --dense-stream (default 65536). Smaller host "
+                          "tensors such as 1-D norms, biases, and router gates stay permanently resident.");
+        d.value_hint = "N";
+        at_least(d, 0, "bytes");
+        bind_int(d, [](RunConfig & c) -> int & { return c.moe.dense_min_bytes; });
+        d.details = "Host dense tensors smaller than this threshold stay resident in RAM so tiny norms and biases "
+                    "never pay per-layer I/O.";
+        t.push_back(d);
+    }
+    {
         ParamDesc d = row("row-stream", "Row-stream tables", G::Memory, L::Advanced,
                           "Serve dense tables the graph only gathers rows from (a token embedding) from "
                           "flash instead of RAM. Which tables qualify comes from the graph, not a name list.");

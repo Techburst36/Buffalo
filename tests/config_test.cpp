@@ -288,6 +288,35 @@ int main() {
         expect_fail("http_threads above max rejected", c);
     }
 
+    // Layer-wise dense weight streaming (--dense-stream): works standalone on dense models or
+    // alongside --moe-stream, unlocks --row-stream, and disables wide-matmul op_offload when
+    // combined with partial GPU offload.
+    {
+        RunConfig c = ok_base();
+        c.moe.dense_stream = true;
+        expect_ok("dense_stream standalone valid", c);
+        c.moe.dense_cache_mb = 64;
+        c.moe.dense_min_bytes = 16384;
+        expect_ok("dense_stream with explicit cache and min_bytes valid", c);
+        c.moe.row_stream = true;
+        expect_ok("row_stream allowed with dense_stream alone", c);
+        c.moe.enabled = true;
+        expect_ok("dense_stream combined with moe_stream valid", c);
+        c.moe.dense_cache_mb = -1;
+        expect_fail("dense_cache_mb negative rejected", c);
+        c.moe.dense_cache_mb = 0;
+        c.moe.dense_min_bytes = -1;
+        expect_fail("dense_min_bytes negative rejected", c);
+        c.moe.dense_min_bytes = MoeStreamConfig::dense_min_bytes_default;
+        if (!offloads_wide_matmuls(c.moe, /*n_gpu_layers=*/3, /*prefill_device=*/false) &&
+            !offloads_wide_matmuls(c.moe, /*n_gpu_layers=*/0, /*prefill_device=*/false)) {
+            std::printf("[PASS] dense_stream disables wide-matmul op_offload\n");
+        } else {
+            std::printf("[FAIL] dense_stream should disable wide-matmul op_offload\n");
+            ++failures;
+        }
+    }
+
     // Sampling ranges — enforced only when temp > 0.
     {
         RunConfig c = ok_base();

@@ -18,6 +18,8 @@
 #include "llama_log.h"
 #include "../moe/router_hook.h"
 #include "../moe/decide_probe.h"
+#include "../moe/dense_stream_source.h"
+#include "../moe/dense_weights.h"
 #include "../moe/gate_gemv.h"
 #include "../moe/expert_stream_source.h"
 #include "../moe/gguf_offsets.h"
@@ -382,6 +384,8 @@ struct Session::Impl {
     };
     std::unique_ptr<RegisteredHostMemory> expert_host_registered;
     ExpertStreamSource source;
+    DenseStreamSource dense_stream;
+    DenseWeights standalone_dense; // used when --dense-stream runs without --moe-stream (pure dense models)
     // Kept per session, not per turn: the reference it measures stalls against is this machine's,
     // and a later turn of a chat is compared with what the earlier ones settled to.
     CacheBrake brake;
@@ -445,10 +449,14 @@ struct Session::Impl {
         return prefill ? prefill->place(on_device, hold_slots) : false;
     }
     int decode_placed(llama_context * c, const llama_batch & b) {
-        return prefill ? prefill->decode(c, b) : llama_decode(c, b);
+        const int rc = prefill ? prefill->decode(c, b) : llama_decode(c, b);
+        if (hook) hook->end_dense_batch();
+        return rc;
     }
     int decode_placed_ext(llama_context * c, llama_batch_ext * b) {
-        return prefill ? prefill->decode_ext(c, b) : llama_process(c, LLAMA_PROCESS_TYPE_DECODE, b);
+        const int rc = prefill ? prefill->decode_ext(c, b) : llama_process(c, LLAMA_PROCESS_TYPE_DECODE, b);
+        if (hook) hook->end_dense_batch();
+        return rc;
     }
     // Every exit from a prefill (errors and cancellation included) leaves the weights on the host:
     // the next graph may be a decode, and the CPU cannot read a device buffer.
@@ -639,7 +647,10 @@ struct Session::Impl {
     void hand_over_dense_weights(const SessionConfig & cfg,
                                  const GgufOffsets & offs,
                                  const std::vector<LayerExperts> & layers,
-                                 std::vector<std::string> & unaccounted);
+                                 std::vector<std::string> & unaccounted,
+                                 std::vector<DenseTensorRef> & resident_dense,
+                                 std::vector<DenseTensorRef> & streamed_dense,
+                                 std::vector<DenseTensorRef> & row_tensors);
     void
     release_mapping(const SessionConfig & cfg, const GgufOffsets & offs, const std::vector<std::string> & unaccounted);
     void arm_route_trace(Opening & o, int n_expert, std::vector<uint64_t> dense_bytes);
@@ -664,8 +675,11 @@ struct Session::Impl {
         // prediction worker goes first of all: it reads gate weights the source frees.
         if (hook) {
             hook->predict_worker_stop();
+            hook->set_dense_source(nullptr);
             hook->clear_device_cache();
         }
+        dense_stream.shutdown();
+        standalone_dense.shutdown();
         source.shutdown();
         // Hands every weight back to its mapping, then frees the device copy: before the model goes.
         prefill.reset();
@@ -772,6 +786,9 @@ bool Session::render_chat(const GenerateRequest & req, std::string & prompt, std
 void Session::set_cache_budget_mb(int mib) {
     impl_->source.set_cache_budget((size_t) std::max(0, mib) * 1024ull * 1024ull);
 }
+DenseStreamStats Session::dense_stream_stats() const {
+    return impl_->dense_stream.stats();
+}
 // Teacher-forced perplexity. See PplRequest for why the batch is labelled decode.
 PplResult Session::perplexity(const PplRequest & req) {
     auto & im = *impl_;
@@ -811,6 +828,7 @@ PplResult Session::perplexity(const PplRequest & req) {
         batch_fill(warm, tokens.data(), 1, 0, false);
         im.hook->set_batch_phase(req.as_decode ? 1 : 0);
         const int rc = llama_decode(ctx, warm);
+        if (im.hook) im.hook->end_dense_batch();
         llama_batch_free(warm);
         if (rc != 0) {
             r.error = "warm-up decode failed";
@@ -856,7 +874,9 @@ PplResult Session::perplexity(const PplRequest & req) {
         const int prefix = std::max(1, std::min(req.skip, n - 1));
         batch_fill(b, tokens.data(), prefix, /*pos0*/ 0, /*all_logits*/ false);
         im.hook->set_batch_phase(0);
-        if (llama_decode(ctx, b) != 0) {
+        const int prc = llama_decode(ctx, b);
+        if (im.hook) im.hook->end_dense_batch();
+        if (prc != 0) {
             r.error = "prefill decode failed";
             return r;
         }
@@ -865,7 +885,9 @@ PplResult Session::perplexity(const PplRequest & req) {
         for (int pos = prefix; pos < last; ++pos) {
             batch_fill(b, tokens.data() + pos, 1, pos, /*all_logits*/ true);
             im.hook->set_batch_phase(1);
-            if (llama_decode(ctx, b) != 0) {
+            const int drc = llama_decode(ctx, b);
+            if (im.hook) im.hook->end_dense_batch();
+            if (drc != 0) {
                 r.error = "decode failed at position " + std::to_string(pos);
                 return r;
             }
@@ -1128,6 +1150,14 @@ bool Session::Impl::load_model(Opening & o, llama_model ** reference) {
         const RemoteGgufMeta & rem = o.ensure_remote();
         if (!rem.ok) return o.fail(rem.error.empty() ? ("cannot open remote GGUF: " + cfg.model_path) : rem.error);
 
+        std::unordered_set<std::string> routed_names;
+        std::vector<std::regex> user_re;
+        if (!cfg.buft_overrides.empty()) {
+            user_re.reserve(cfg.buft_overrides.size());
+            for (const std::string & pat : cfg.buft_overrides)
+                user_re.emplace_back(pat);
+        }
+
         // When streaming a remote MoE model, override routed expert tensors to our
         // virtual-reservation host buffer type so llama_model_init_from_user() reserves
         // address space with 0 physical RAM committed and fetches 0 routed expert bytes over HTTP.
@@ -1137,17 +1167,17 @@ bool Session::Impl::load_model(Opening & o, llama_model ** reference) {
                 return o.fail("not a MoE this engine streams: " + lay.error +
                               ". Turn {moe-stream} off to run it resident (docs/which-models-stream.md).");
 
+            for (const TensorExtent & ext : rem.meta.offsets.extents) {
+                int elayer = 0;
+                if (lay.slot_of(ext.name.c_str(), elayer) >= 0) routed_names.insert(ext.name);
+            }
+
             if (cfg.n_gpu_layers == 0 || cfg.buft_overrides.empty()) {
                 vhost_patterns.reserve((size_t) lay.n_slots);
                 for (int p = 0; p < lay.n_slots; ++p) {
                     vhost_patterns.push_back("^blk\\.[0-9]+\\." + regex_escape_literal(lay.suffix[p]) + "\\.weight$");
                 }
             } else {
-                std::vector<std::regex> user_re;
-                user_re.reserve(cfg.buft_overrides.size());
-                for (const std::string & pat : cfg.buft_overrides)
-                    user_re.emplace_back(pat);
-
                 std::vector<std::string> matched_routed;
                 size_t total_routed = 0;
                 for (const TensorExtent & ext : rem.meta.offsets.extents) {
@@ -1172,6 +1202,63 @@ bool Session::Impl::load_model(Opening & o, llama_model ** reference) {
                     for (const std::string & name : matched_routed)
                         vhost_patterns.push_back("^" + regex_escape_literal(name) + "$");
                 }
+            }
+        }
+
+        // When dense streaming is enabled on a remote HTTP model, also override host-resident
+        // dense tensors (>= dense_min_bytes) to bmoe_virtual_host_buffer_type() so boot downloads
+        // 0 bytes of streamed dense layers while GPU-offloaded layers still load straight into VRAM.
+        if (cfg.moe.dense_stream) {
+            bool has_gpu = false;
+            if (!cpu_only && cfg.n_gpu_layers > 0 && !cfg.prefill.enabled()) {
+                if (!cfg.device_list.empty() || !cfg.device_split.empty()) {
+                    has_gpu = true;
+                } else {
+                    std::vector<ggml_backend_dev_t> devs_probe;
+                    if (const ggml_backend_dev_t * devs = detail::PrefillPath::devices_without_prefill(devs_probe)) {
+                        has_gpu = devs[0] != nullptr;
+                    } else {
+                        for (size_t i = 0; i < ggml_backend_dev_count(); ++i) {
+                            const auto ty = ggml_backend_dev_type(ggml_backend_dev_get(i));
+                            if (ty == GGML_BACKEND_DEVICE_TYPE_GPU || ty == GGML_BACKEND_DEVICE_TYPE_IGPU) {
+                                has_gpu = true;
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
+            // Mirror llama-model.cpp:1766-1791 layer-to-device split exactly.
+            const bool load_mtp_now = cfg.spec.is_mtp() && cfg.spec.mtp_head.empty();
+            const int n_layer_trunk = std::max(0, rem.meta.info.n_block - rem.meta.info.n_nextn);
+            const int n_layer_all = load_mtp_now ? rem.meta.info.n_block : n_layer_trunk;
+            const int act_gpu_layers = has_gpu ? std::min(cfg.n_gpu_layers, n_layer_all + 1) : 0;
+            const int i_gpu_start = std::max(n_layer_all + 1 - cfg.n_gpu_layers, 0);
+            const uint64_t min_bytes = (uint64_t) std::max(0, cfg.moe.dense_min_bytes);
+
+            auto forced_cpu = [&](const std::string & name) {
+                for (const std::regex & re : user_re)
+                    if (std::regex_search(name, re)) return true;
+                return false;
+            };
+
+            for (const auto & kv : rem.meta.offsets.size_by_name) {
+                const std::string & name = kv.first;
+                const uint64_t sz = kv.second;
+                if (sz < min_bytes) continue;
+                if (routed_names.count(name)) continue;
+                if (!load_mtp_now && tensor_names::is_mtp_tensor(name.c_str())) continue;
+                const int bl = tensor_names::block_layer(name.c_str());
+                if (bl >= 0) {
+                    if (bl >= n_layer_all) continue;
+                    const bool on_gpu = act_gpu_layers > 0 && bl >= i_gpu_start && (bl - i_gpu_start) < act_gpu_layers;
+                    if (on_gpu && !forced_cpu(name)) continue;
+                } else {
+                    // Output head is assigned to slot n_layer_all (GPU when act_gpu_layers > 0);
+                    // token_embd.weight is always on CPU.
+                    if (tensor_names::is_output_head(name) && act_gpu_layers > 0 && !forced_cpu(name)) continue;
+                }
+                vhost_patterns.push_back("^" + regex_escape_literal(name) + "$");
             }
         }
     }
@@ -1572,7 +1659,8 @@ bool Session::Impl::create_contexts(Opening & o) {
     // the copy of the experts into a device's host memory.
     // The copy captures on the context the device cache then makes again, which needs no callback.
     const bool copy_capture = !cfg.moe.expert_host_buffer.empty() && !device_cache_armed;
-    if (cfg.moe.enabled || o.compute_trace || prefill || records_unstreamed(cfg) || copy_capture) {
+    if (cfg.moe.enabled || cfg.moe.dense_stream || o.compute_trace || prefill || records_unstreamed(cfg) ||
+        copy_capture) {
         cparams.cb_eval = &RouterHook::c_eval;
         cparams.cb_eval_user_data = hook.get();
     }
@@ -1752,7 +1840,7 @@ void Session::Impl::install_abort_callback() {
                 if (!p->cancel_quieted.exchange(true, std::memory_order_relaxed)) detail::llama_log_cancel_begin();
                 return true;
             }
-            return p->source.fatal();
+            return p->source.fatal() || p->dense_stream.fatal();
         },
         this);
 }
@@ -1879,7 +1967,10 @@ bool Session::Impl::bind_expert_offsets(Opening & o,
 void Session::Impl::hand_over_dense_weights(const SessionConfig & cfg,
                                             const GgufOffsets & offs,
                                             const std::vector<LayerExperts> & layers,
-                                            std::vector<std::string> & unaccounted) {
+                                            std::vector<std::string> & unaccounted,
+                                            std::vector<DenseTensorRef> & resident_dense,
+                                            std::vector<DenseTensorRef> & streamed_dense,
+                                            std::vector<DenseTensorRef> & row_tensors) {
     const std::unordered_set<std::string> expert_names = expert_tensor_names(layers);
     // The subset the graph only row-gathers, when the run asked for the row policy. Their
     // membership is the hook's verdict on what the graph did, and this is a filter over the
@@ -1890,7 +1981,7 @@ void Session::Impl::hand_over_dense_weights(const SessionConfig & cfg,
     // one name over one file range, and a name-keyed walk would rebind only one of them
     // and leave the other reading the mmap for the life of the run. Twins are folded into
     // one entry's alias list so the bytes are still read and allocated exactly once.
-    std::vector<DenseTensorRef> dense, rows;
+    std::vector<DenseTensorRef> dense;
     std::unordered_map<uint64_t, size_t> dense_at; // (shard, file offset) -> index in `dense`
     for (ggml_tensor * t : hook->captured_weight_objects()) {
         if (!t) continue;
@@ -1924,9 +2015,6 @@ void Session::Impl::hand_over_dense_weights(const SessionConfig & cfg,
         d.file_idx = file_idx;
         dense_at.emplace(key, dense.size());
         dense.push_back(d);
-        // A table with a twin is by definition also read some other way, so it cannot have
-        // qualified as row-gathered; the guard costs nothing and keeps that coupling explicit.
-        if (row_names.count(name)) rows.push_back(d);
     }
     for (const DenseTensorRef & d : dense)
         if (!d.aliases.empty())
@@ -1946,9 +2034,23 @@ void Session::Impl::hand_over_dense_weights(const SessionConfig & cfg,
         for (const auto & kv : offs.off_by_name)
             if (!expert_names.count(kv.first) && !owned.count(kv.first)) unaccounted.push_back(kv.first);
     }
-    const uint64_t row_budget = (uint64_t) std::max(0, cfg.moe.row_stream_mb) * 1024ull * 1024ull;
-    source.set_dense_tensors(std::move(dense));
-    source.set_row_tensors(std::move(rows), row_budget);
+
+    resident_dense.clear();
+    streamed_dense.clear();
+    row_tensors.clear();
+    const uint64_t min_bytes = (uint64_t) std::max(0, cfg.moe.dense_min_bytes);
+    for (DenseTensorRef & d : dense) {
+        const std::string name = d.tensor ? d.tensor->name : "";
+        const bool is_row = row_names.count(name) > 0 && d.aliases.empty();
+        if (is_row) {
+            row_tensors.push_back(d);
+            resident_dense.push_back(std::move(d)); // DenseWeights::take_row_gathered intersects against tensors_
+        } else if (cfg.moe.dense_stream && d.size >= min_bytes) {
+            streamed_dense.push_back(std::move(d));
+        } else {
+            resident_dense.push_back(std::move(d));
+        }
+    }
 }
 
 // Drop the model file's mapping once nothing reads through it (core/src/io/mapping_release.h).
@@ -1984,8 +2086,13 @@ void Session::Impl::release_mapping(const SessionConfig & cfg,
         const pio::MappingReleaseReport r = pio::release_file_mappings(offs.shard_paths, &mapping_placeholders);
         // Lanes opened while the section was alive stay serialised against it even once it
         // is gone (measured: iobench S3 vs S4), so the readers are reopened after the release.
-        if (r.supported && (r.views_unmapped || r.sections_closed) && !source.reopen_readers())
-            log_printf(LogLevel::Warn, "release-mmap: reader reopen failed; reads stay serialised");
+        if (r.supported && (r.views_unmapped || r.sections_closed)) {
+            bool reopened = true;
+            if (cfg.moe.enabled) reopened = source.reopen_readers() && reopened;
+            if (dense_stream.active()) reopened = dense_stream.reopen_readers() && reopened;
+            if (!cfg.moe.enabled && cfg.moe.dense_stream) reopened = standalone_dense.reopen_readers() && reopened;
+            if (!reopened) log_printf(LogLevel::Warn, "release-mmap: reader reopen failed; reads stay serialised");
+        }
         if (r.supported) // POSIX has nothing to undo and says nothing
             log_printf(LogLevel::Info, "release-mmap: %d view(s) unmapped (%llu MiB), %d section(s) closed%s%s%s",
                        r.views_unmapped, (unsigned long long) (r.bytes >> 20), r.sections_closed,
@@ -2259,29 +2366,68 @@ bool Session::Impl::bind_streaming(Opening & o) {
     const GgufOffsets & offs = o.meta().offsets;
     if (!offs.ok) return o.fail("cannot read gguf offsets: " + cfg.model_path);
 
-    std::vector<LayerExperts> layers = hook->captured();
+    std::vector<LayerExperts> layers;
     int n_expert = 0;
-    if (!bind_expert_offsets(o, offs, layers, n_expert)) return false;
-
-    // Computed before init consumes `layers`: the dense split needs the captured expert
-    // tensor names and the gguf sizes together.
     std::vector<uint64_t> dense_bytes;
-    if (o.route_trace) dense_bytes = dense_bytes_per_layer(offs, layers, o.n_layer_streamed);
+    if (cfg.moe.enabled) {
+        layers = hook->captured();
+        if (!bind_expert_offsets(o, offs, layers, n_expert)) return false;
+        // Computed before init consumes `layers`: the dense split needs the captured expert
+        // tensor names and the gguf sizes together.
+        if (o.route_trace) dense_bytes = dense_bytes_per_layer(offs, layers, o.n_layer_streamed);
+    }
 
     std::vector<std::string> unaccounted; // file tensors no policy owns; decides release-mmap below
-    hand_over_dense_weights(cfg, offs, layers, unaccounted);
+    std::vector<DenseTensorRef> resident_dense, streamed_dense, row_tensors;
+    hand_over_dense_weights(cfg, offs, layers, unaccounted, resident_dense, streamed_dense, row_tensors);
+    const uint64_t row_budget = (uint64_t) std::max(0, cfg.moe.row_stream_mb) * 1024ull * 1024ull;
 
-    if (prefill) prefill->keep_stream_layout(layers, offs.shard_paths);
-    if (prefill && cfg.prefill.slots_on_demand) prefill->share_memory_with(&source);
-    if (prefill) prefill->read_experts_from(&source);
-    if (!source.init(offs.shard_paths, n_expert, std::move(layers), cfg.moe, std::move(o.remote.provider)))
-        return o.fail("expert stream source init failed");
-    source.set_pin_floor(source.worst_cycle_bytes(n_expert_used));
-    source.set_top_k(n_expert_used);
-    hook->set_source(&source);
-    // The row policy exists only once dense_.init has taken the tables over; null means nothing
-    // qualified or the takeover declined, and the hook then costs exactly nothing per node.
-    hook->set_row_source(source.row_source());
+    if (cfg.moe.enabled) {
+        source.set_dense_tensors(std::move(resident_dense));
+        source.set_row_tensors(std::move(row_tensors), row_budget);
+        if (prefill) prefill->keep_stream_layout(layers, offs.shard_paths);
+        if (prefill && cfg.prefill.slots_on_demand) prefill->share_memory_with(&source);
+        if (prefill) prefill->read_experts_from(&source);
+        if (!source.init(offs.shard_paths, n_expert, std::move(layers), cfg.moe, std::move(o.remote.provider)))
+            return o.fail("expert stream source init failed");
+        source.set_pin_floor(source.worst_cycle_bytes(n_expert_used));
+        source.set_top_k(n_expert_used);
+        hook->set_source(&source);
+        // The row policy exists only once dense_.init has taken the tables over; null means nothing
+        // qualified or the takeover declined, and the hook then costs exactly nothing per node.
+        hook->set_row_source(source.row_source());
+    } else if (cfg.moe.dense_stream) {
+        // Pure dense model (or MoE with only --dense-stream): handle the tiny permanently resident
+        // weights (norms, biases) and optional --row-stream tables via standalone_dense, excluding
+        // streamed dense weight byte ranges so Warmed/sensor never touch streamed layers.
+        std::vector<std::vector<std::pair<uint64_t, uint64_t>>> excluded(offs.shard_paths.size());
+        for (const DenseTensorRef & d : streamed_dense) {
+            if (d.file_idx >= 0 && (size_t) d.file_idx < excluded.size())
+                excluded[(size_t) d.file_idx].push_back({d.file_off, d.file_off + d.size});
+        }
+        std::vector<std::vector<std::pair<uint64_t, uint64_t>>> dense_ranges(offs.shard_paths.size());
+        if (!is_remote_url(cfg.model_path)) {
+            for (size_t s = 0; s < offs.shard_paths.size(); ++s) {
+                pio::fd_t fd = pio::open_read(offs.shard_paths[s].c_str(), false);
+                const uint64_t fsz = pio::fd_ok(fd) ? pio::file_size(fd) : 0;
+                if (pio::fd_ok(fd)) pio::close_fd(fd);
+                dense_ranges[s] = DenseWeights::byte_ranges(std::move(excluded[s]), fsz);
+            }
+        }
+        if (!row_tensors.empty()) standalone_dense.set_row_gathered(std::move(row_tensors), row_budget);
+        if (!cfg.moe.dense_mapped.empty()) standalone_dense.set_mapped(cfg.moe.dense_mapped);
+        if (!standalone_dense.init(cfg.moe.dense_weights, offs.shard_paths, std::move(dense_ranges),
+                                   std::move(resident_dense), cfg.moe.io_backend, http_options_from(cfg.moe)))
+            return o.fail("resident dense weights init failed");
+        hook->set_row_source(standalone_dense.row_source());
+    }
+
+    if (cfg.moe.dense_stream && !streamed_dense.empty()) {
+        if (!dense_stream.init(offs.shard_paths, std::move(streamed_dense), o.n_layer_streamed, cfg.moe,
+                               std::move(o.remote.provider)))
+            return o.fail("dense stream source init failed");
+        hook->set_dense_source(&dense_stream);
+    }
 
     if (!is_remote_url(cfg.model_path)) {
         release_mapping(cfg, offs, unaccounted);
@@ -2300,17 +2446,19 @@ bool Session::Impl::bind_streaming(Opening & o) {
         }
     }
 
-    if (o.route_trace) arm_route_trace(o, n_expert, std::move(dense_bytes));
-    arm_routing_record(o, n_expert);
+    if (cfg.moe.enabled) {
+        if (o.route_trace) arm_route_trace(o, n_expert, std::move(dense_bytes));
+        arm_routing_record(o, n_expert);
 
-    if (o.io_trace) {
-        io_trace = o.io_trace;
-        source.set_io_trace(true);
+        if (o.io_trace) {
+            io_trace = o.io_trace;
+            source.set_io_trace(true);
+        }
+
+        if (cfg.moe.overlap && !source.enable_overlap_hook())
+            return o.fail("{overlap} needs the expert-ready hook of the bmoe llama.cpp fork, and the CPU backend "
+                          "loaded here does not expose it: turn {overlap} off (docs/seam.md)");
     }
-
-    if (cfg.moe.overlap && !source.enable_overlap_hook())
-        return o.fail("{overlap} needs the expert-ready hook of the bmoe llama.cpp fork, and the CPU backend "
-                      "loaded here does not expose it: turn {overlap} off (docs/seam.md)");
 
     clear_memory(ctx.get()); // discard warm-up KV
     if (ctx_dft) llama_memory_clear(llama_get_memory(ctx_dft.get()), true);
@@ -3014,7 +3162,7 @@ std::unique_ptr<Session> Session::open_placed(const SessionConfig & cfg,
     im.build_sampler(cfg);
     im.install_abort_callback();
     if (!im.init_speculation(o)) return nullptr;
-    if (cfg.moe.enabled && !im.bind_streaming(o)) return nullptr;
+    if ((cfg.moe.enabled || cfg.moe.dense_stream) && !im.bind_streaming(o)) return nullptr;
     if (records_unstreamed(cfg) && !im.arm_unstreamed_record(o)) return nullptr;
     if (!cfg.moe.expert_host_buffer.empty() && !im.stage_experts_in_host_buffer(o)) return nullptr;
     if (cfg.moe.device_cache_mb > 0 && !im.arm_device_cache(o)) return nullptr;
@@ -3647,6 +3795,7 @@ struct Session::Impl::Turn {
                     res.cancelled = true;
                     return false;
                 }
+                if (im.dense_stream.fatal()) return fail(RunError::Failed, "dense stream I/O failed during prefill");
                 if (im.source.overlap() && im.source.fatal())
                     return fail(RunError::Failed, "expert stream I/O failed during overlap prefill");
                 return fail(RunError::Failed, "prefill decode failed");
@@ -3883,6 +4032,7 @@ struct Session::Impl::Turn {
         // would land in the next logits read and be billed to loop overhead, and a two-GPU run read
         // 1777 tok/s for 241. On the CPU the graph is already done and this returns at once.
         llama_synchronize(ctx);
+        if (im.hook) im.hook->end_dense_batch();
         s.s1 = clock_t_::now();
         loop_mark = s.s1; // the next token's overhead is measured from here
         s.f1 = pio::major_faults();
@@ -4116,6 +4266,7 @@ struct Session::Impl::Turn {
                     res.cancelled = true;
                     break;
                 }
+                if (im.dense_stream.fatal()) return fail(RunError::Failed, "dense stream I/O failed during decode");
                 if (im.source.overlap() && im.source.fatal())
                     return fail(RunError::Failed, "expert stream I/O failed during overlap decode");
                 return fail(RunError::Failed, "decode failed during generation");
@@ -4277,6 +4428,7 @@ struct Session::Impl::Turn {
             s.route_ahead_issue_ns = im.hook->route_ahead_issue_ns();
             s.route_ahead_wd_ns = im.hook->route_ahead_wd_ns();
         }
+        if (moe.dense_stream) s.dense_stream = im.dense_stream.stats();
         if (sink) sink->on_summary(s);
     }
 

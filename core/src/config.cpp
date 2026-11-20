@@ -334,14 +334,21 @@ ValidationResult validate(const RunConfig & cfg) {
     }
 
     // The row policy is discovered during the streamer's capture decode and acted on in its eval
-    // callback; without streaming neither exists. It is also not a dense-mode variant — it applies
-    // under every DenseWeightsMode, because what it changes is which tensors the mode is applied to.
-    if (cfg.moe.row_stream && !cfg.moe.enabled) {
-        return fail("{row-stream} needs {moe-stream}: the tables it serves are found and fed by the streamer, "
-                    "which does not run without streaming");
+    // callback; without either expert or dense streaming neither exists. It is also not a
+    // dense-mode variant — it applies under every DenseWeightsMode, because what it changes is
+    // which tensors the mode is applied to.
+    if (cfg.moe.row_stream && !cfg.moe.enabled && !cfg.moe.dense_stream) {
+        return fail("{row-stream} needs {moe-stream} or {dense-stream}: the tables it serves are found and fed by "
+                    "the streamer, which does not run without streaming");
     }
     if (cfg.moe.row_stream_mb < 0) {
         return fail("{row-stream-mb} cannot be negative (0 uses the built-in window)");
+    }
+    if (cfg.moe.dense_cache_mb < 0) {
+        return fail("{dense-cache-mb} cannot be negative (0 uses the automatic 2-layer window)");
+    }
+    if (cfg.moe.dense_min_bytes < 0) {
+        return fail("{dense-min-bytes} cannot be negative");
     }
     if (cfg.moe.http_cache_mb < 0) {
         return fail("{http-cache-mb} cannot be negative (0 disables the local disk spill cache)");
@@ -501,12 +508,17 @@ bool offloads_wide_matmuls(const MoeStreamConfig & moe, int n_gpu_layers, bool p
     // streaming has every routed expert in place before the matmul's split starts, so only overlap
     // gives the offload up; the decode's one-token graphs are never offloaded either way.
     if (moe.enabled && moe.overlap && n_gpu_layers != 0) return false;
+    // Under dense streaming, host-resident dense weights are uncommitted/evicted until cb_eval
+    // materializes them just before each host layer executes. With partial GPU offload, a wide
+    // prefill graph's op_offload would otherwise copy unmaterialized host dense weights onto the
+    // GPU in ggml_backend_sched_copy_input() before cb_eval runs. Keep host dense ops on the CPU.
+    if (moe.dense_stream && n_gpu_layers != 0) return false;
     // With no layer placed at all, a device is registered only because the caller asked for every
     // one (`devices=all`); the streamer still rebinds the expert tensors at compute time, on the
     // CPU, and a backend that takes those ops copies whatever the tensors pointed at before.
     // Measured on a phone with its GPU backends registered and nothing placed: a 15-token prompt
     // that answers in 22 s on the CPU alone had not produced a token after eight minutes.
-    if (moe.enabled && n_gpu_layers == 0) return false;
+    if ((moe.enabled || moe.dense_stream) && n_gpu_layers == 0) return false;
     return true;
 }
 

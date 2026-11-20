@@ -330,6 +330,9 @@ public:
     // when the cache is off. The only way the budget moves after init sizes it.
     void set_cache_budget_mb(int mib);
 
+    // Current cumulative counters of the dense weight streamer (--dense-stream; zero when off).
+    DenseStreamStats dense_stream_stats() const;
+
     // Score a fixed text under teacher forcing. Clears the KV; leaves no conversation state behind.
     PplResult perplexity(const PplRequest & req);
 

@@ -179,6 +179,19 @@ target_include_directories(bmoe_http_range_test PRIVATE
 target_include_directories(bmoe_http_range_test SYSTEM PRIVATE
     ${CMAKE_SOURCE_DIR}/third_party/llama.cpp/vendor)
 
+# Milestone 3: Layer-wise dense weight streaming (--dense-stream) across pure dense, partial GPU,
+# MoE+Dense combined (qwen3moe, gemma4, nemotron_h_moe), and zero-disk HTTP.
+add_executable(bmoe_dense_stream_test dense_stream_test.cpp)
+target_link_libraries(bmoe_dense_stream_test PRIVATE bmoe_core vendor::cpp-httplib)
+if(WIN32)
+    target_link_libraries(bmoe_dense_stream_test PRIVATE ws2_32)
+endif()
+target_include_directories(bmoe_dense_stream_test PRIVATE
+    ${CMAKE_SOURCE_DIR}/core/src/io
+    ${CMAKE_SOURCE_DIR}/core/src/moe)
+target_include_directories(bmoe_dense_stream_test SYSTEM PRIVATE
+    ${CMAKE_SOURCE_DIR}/third_party/llama.cpp/vendor)
+
 # self_path: the executable's own file with every link resolved, so a link on PATH (what install.sh
 # puts there) still finds the backend modules beside the real file (#605). Starts itself again
 # through a link; no model.
@@ -336,6 +349,23 @@ if(PYTHON3)
                      "${CMAKE_CURRENT_BINARY_DIR}/tiny-moe-split-00001-of-00004.gguf")
     set_tests_properties(http_range PROPERTIES
                          FIXTURES_REQUIRED "TINY_MOE_MODEL_qwen3moe;TINY_MOE_MODEL_split")
+
+    # Pure dense Qwen3 fixture (n_expert = 0, 6 layers, ~15.75 MiB dense weights) for --dense-stream tests.
+    add_test(
+        NAME moe_make_tiny_model_qwen3
+        COMMAND ${PYTHON3} ${CMAKE_SOURCE_DIR}/scripts/make-tiny-moe.py --arch qwen3
+                --out "${CMAKE_CURRENT_BINARY_DIR}/tiny-dense-qwen3.gguf"
+    )
+    set_tests_properties(moe_make_tiny_model_qwen3 PROPERTIES FIXTURES_SETUP TINY_MOE_MODEL_qwen3)
+
+    add_test(NAME dense_stream
+             COMMAND bmoe_dense_stream_test
+                     "${CMAKE_CURRENT_BINARY_DIR}/tiny-dense-qwen3.gguf"
+                     "${CMAKE_CURRENT_BINARY_DIR}/tiny-moe-qwen3moe.gguf"
+                     "${CMAKE_CURRENT_BINARY_DIR}/tiny-moe-gemma4.gguf"
+                     "${CMAKE_CURRENT_BINARY_DIR}/tiny-moe-nemotron_h_moe.gguf")
+    set_tests_properties(dense_stream PROPERTIES
+                         FIXTURES_REQUIRED "TINY_MOE_MODEL_qwen3;TINY_MOE_MODEL_qwen3moe;TINY_MOE_MODEL_gemma4;TINY_MOE_MODEL_nemotron_h_moe")
 else()
     message(WARNING "python3 not found: MoE gates will not run (models cannot be generated)")
 endif()

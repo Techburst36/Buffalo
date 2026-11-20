@@ -24,6 +24,19 @@ struct TokenLogprob {
     float logprob = 0.0f;
 };
 
+// Telemetry counters for layer-wise dense weight streaming (--dense-stream).
+struct DenseStreamStats {
+    uint64_t total_streamed_weight_bytes = 0; // sum of bytes across all managed dense tensors
+    uint64_t budget_bytes = 0;                // active resident RAM budget
+    uint64_t bytes_read = 0;                  // cumulative bytes read from BlockProvider
+    uint64_t groups_loaded = 0;               // total group loads completed (sync + prefetch)
+    uint64_t groups_evicted = 0;              // total group evictions via pio::vm_evict()
+    uint64_t prefetch_hits = 0;               // ensure_group_pinned() hits on async-prefetched groups
+    uint64_t peak_resident_bytes = 0;         // high-water mark of resident streamed dense bytes
+    uint64_t current_resident_bytes = 0;      // currently resident streamed dense bytes
+    uint64_t io_errors = 0;                   // failed group reads (non-zero triggers fatal abort)
+};
+
 struct TokenMetrics {
     int step = 0;            // 1-based index of this token
     int steps = 0;           // n_predict target
@@ -335,6 +348,9 @@ struct RunSummary {
     long long route_ahead_gemv_jobs = 0;
     long long route_ahead_issue_ns = 0; // eval-thread cost of issuing the early reads
     long long route_ahead_wd_ns = 0;    // eval-thread cost of the sampled fresh-gate watchdog
+
+    // Layer-wise dense weight streaming totals (zero when --dense-stream is off).
+    DenseStreamStats dense_stream;
 };
 
 // What this run IS: the model and the configuration every row below it was produced under.

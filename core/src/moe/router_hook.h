@@ -38,6 +38,7 @@
 namespace bmoe {
 class DeviceExpertArena;
 class DecideProbe;
+class DenseStreamSource;
 } // namespace bmoe
 
 #include <atomic>
@@ -148,6 +149,17 @@ public:
     // Install the row-gathered residency policy (see bmoe/row_source.h). Non-null makes the stream
     // pass check every gather node against it and make the rows present before the node runs.
     void set_row_source(IRowSource * src) { row_source_ = src; }
+
+    // Install the layer-wise dense weight streamer (--dense-stream). Non-null makes the eval
+    // callback pin each host dense group before its first node executes, isolate layer-end /
+    // non-block boundaries so finished groups unpin and evict cleanly, and trigger 1-layer
+    // background look-ahead.
+    void set_dense_source(DenseStreamSource * src) {
+        dense_source_ = src;
+        dense_active_.clear();
+    }
+    // Unpin any remaining active dense groups once llama_decode() returns.
+    void end_dense_batch();
 
     // Temporal prefetch depth K: while streaming layer l, hint the source to read ahead the
     // experts the previous token used at layers l+1..l+K. 0 (default) disables it.
@@ -377,8 +389,10 @@ private:
     ExpertLayout layout_;
     int n_layer_ = 0;
     bool capturing_ = false;
-    IExpertSource * source_ = nullptr;  // non-null → stream mode
-    IRowSource * row_source_ = nullptr; // row-gathered dense tables, when the policy is on
+    IExpertSource * source_ = nullptr;      // non-null → stream mode
+    IRowSource * row_source_ = nullptr;     // row-gathered dense tables, when the policy is on
+    DenseStreamSource * dense_source_ = nullptr; // layer-wise dense streamer (--dense-stream)
+    std::vector<int> dense_active_;         // currently pinned dense group IDs in flight
     const void * dc_ctx_ = nullptr;
     DeviceCacheBatchFn dc_handles_batch_ = nullptr;
     std::vector<uint8_t> dc_layer_cached_;

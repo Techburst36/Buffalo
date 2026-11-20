@@ -162,6 +162,66 @@ def build_qwen3moe(out, split_max_tensors=0):
           f"(top-{N_EXPERT_USED}), vocab {n_vocab}")
 
 
+# --- qwen3: pure dense model (n_expert = 0) ----------------------------------------
+# 6 layers, N_EMBD=256, N_FF=640 (~2.625 MiB per layer, ~15.75 MiB total dense weights) so
+# --dense-cache-mb 6 holds two layers (enabling async 1-layer look-ahead prefetch hits) while
+# still forcing real multi-layer LRU evictions across all 6 layers.
+DENSE_N_LAYER     = 6
+DENSE_N_EMBD      = 256
+DENSE_N_HEAD      = 4
+DENSE_N_HEAD_KV   = 2
+DENSE_N_EMBD_HEAD = DENSE_N_EMBD // DENSE_N_HEAD        # 64
+DENSE_N_EMBD_GQA  = DENSE_N_HEAD_KV * DENSE_N_EMBD_HEAD # 128
+DENSE_N_FF        = 640
+
+
+def build_qwen3(out, split_max_tensors=0):
+    tokens, scores, toktypes = build_vocab()
+    n_vocab = len(tokens)
+
+    w = make_writer(out, "qwen3", split_max_tensors)
+    w.add_name("tiny-dense-qwen3")
+    w.add_context_length(N_CTX)
+    w.add_embedding_length(DENSE_N_EMBD)
+    w.add_block_count(DENSE_N_LAYER)
+    w.add_feed_forward_length(DENSE_N_FF)
+    w.add_head_count(DENSE_N_HEAD)
+    w.add_head_count_kv(DENSE_N_HEAD_KV)
+    w.add_key_length(DENSE_N_EMBD_HEAD)
+    w.add_value_length(DENSE_N_EMBD_HEAD)
+    w.add_rope_freq_base(ROPE_BASE)
+    w.add_layer_norm_rms_eps(RMS_EPS)
+    w.add_file_type(gguf.LlamaFileType.ALL_F32)
+    add_tokenizer(w, tokens, scores, toktypes)
+
+    w.add_tensor("token_embd.weight",  rnd(n_vocab, DENSE_N_EMBD, seed=1))
+    w.add_tensor("output_norm.weight", rnd(DENSE_N_EMBD, seed=2))
+    w.add_tensor("output.weight",      rnd(n_vocab, DENSE_N_EMBD, seed=3))
+
+    s = 100
+    for i in range(DENSE_N_LAYER):
+        p = f"blk.{i}."
+        w.add_tensor(p + "attn_norm.weight",   rnd(DENSE_N_EMBD, seed=s + 0))
+        w.add_tensor(p + "attn_q.weight",      rnd(DENSE_N_EMBD_HEAD * DENSE_N_HEAD, DENSE_N_EMBD, seed=s + 1))
+        w.add_tensor(p + "attn_k.weight",      rnd(DENSE_N_EMBD_GQA, DENSE_N_EMBD, seed=s + 2))
+        w.add_tensor(p + "attn_v.weight",      rnd(DENSE_N_EMBD_GQA, DENSE_N_EMBD, seed=s + 3))
+        w.add_tensor(p + "attn_output.weight", rnd(DENSE_N_EMBD, DENSE_N_EMBD_HEAD * DENSE_N_HEAD, seed=s + 4))
+        w.add_tensor(p + "attn_q_norm.weight", rnd(DENSE_N_EMBD_HEAD, seed=s + 5))
+        w.add_tensor(p + "attn_k_norm.weight", rnd(DENSE_N_EMBD_HEAD, seed=s + 6))
+        w.add_tensor(p + "ffn_norm.weight",    rnd(DENSE_N_EMBD, seed=s + 7))
+        w.add_tensor(p + "ffn_gate.weight",    rnd(DENSE_N_FF, DENSE_N_EMBD, seed=s + 8))
+        w.add_tensor(p + "ffn_up.weight",      rnd(DENSE_N_FF, DENSE_N_EMBD, seed=s + 9))
+        w.add_tensor(p + "ffn_down.weight",    rnd(DENSE_N_EMBD, DENSE_N_FF, seed=s + 10))
+        s += 100
+
+    w.write_header_to_file()
+    w.write_kv_data_to_file()
+    w.write_tensors_to_file()
+    w.close()
+    print(f"wrote {out}: qwen3 (pure dense), {DENSE_N_LAYER} layers, embd {DENSE_N_EMBD}, "
+          f"ff {DENSE_N_FF}, vocab {n_vocab}")
+
+
 # --- gemma4: fused gate+up layout --------------------------------------------------
 # Gemma 4 MoE packs gate+up into one expert tensor (ffn_gate_up_exps) and keeps an
 # always-on shared expert (the layer's dense ffn_{gate,up,down}). We interleave one dense
@@ -382,15 +442,17 @@ def build_nemotron_h_moe(out):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--arch", choices=["qwen3moe", "gemma4", "nemotron_h_moe"], default="qwen3moe")
+    ap.add_argument("--arch", choices=["qwen3", "qwen3moe", "gemma4", "nemotron_h_moe"], default="qwen3moe")
     ap.add_argument("--out", default="tiny-moe.gguf")
     ap.add_argument("--split-max-tensors", type=int, default=0,
                     help="emit a sharded gguf (N tensors per shard, metadata-only first shard)")
     args = ap.parse_args()
 
-    if args.arch != "qwen3moe" and args.split_max_tensors:
-        raise SystemExit("--split-max-tensors is exercised via the qwen3moe fixture only")
-    if args.arch == "gemma4":
+    if args.arch not in ("qwen3", "qwen3moe") and args.split_max_tensors:
+        raise SystemExit("--split-max-tensors is exercised via the qwen3 / qwen3moe fixtures only")
+    if args.arch == "qwen3":
+        build_qwen3(args.out, args.split_max_tensors)
+    elif args.arch == "gemma4":
         build_gemma4(args.out)
     elif args.arch == "nemotron_h_moe":
         build_nemotron_h_moe(args.out)
