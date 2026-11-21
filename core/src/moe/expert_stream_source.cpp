@@ -37,7 +37,8 @@ bool ExpertStreamSource::init(const std::vector<std::string> & shard_paths,
                               int n_expert,
                               std::vector<LayerExperts> layers,
                               const MoeStreamConfig & cfg,
-                              std::unique_ptr<BlockProvider> preopened_provider) {
+                              std::unique_ptr<BlockProvider> preopened_provider,
+                              bool dense_already_resident) {
     if (active_) return false;
     if (n_expert <= 0) {
         log_printf(LogLevel::Error, "expert streaming needs a MoE model (n_expert=%d)", n_expert);
@@ -135,7 +136,7 @@ bool ExpertStreamSource::init(const std::vector<std::string> & shard_paths,
         // dense set twice and overcommits by its whole size — enough to take the device down on a
         // model whose dense set is large (DeepSeek V4's is ~6.5 GiB). Budget as if the conversion
         // had already happened.
-        const bool already_resident = is_remote_url(shard_paths[0]) || cfg.dense_stream;
+        const bool already_resident = dense_already_resident || is_remote_url(shard_paths[0]) || cfg.dense_stream;
         if (!already_resident &&
             (cfg.dense_weights == DenseWeightsMode::Anonymous || cfg.dense_weights == DenseWeightsMode::Pinned)) {
             uint64_t dense_pending = 0;
@@ -312,7 +313,7 @@ bool ExpertStreamSource::init(const std::vector<std::string> & shard_paths,
             ranges[(size_t) s] = DenseWeights::byte_ranges(std::move(exp[(size_t) s]), provider_->shard_size(s));
         dense_.set_row_gathered(std::move(row_tensors_), row_budget_);
         dense_.set_mapped(cfg.dense_mapped);
-        const bool already_resident = is_remote_url(shard_paths[0]) || cfg.dense_stream;
+        const bool already_resident = dense_already_resident || is_remote_url(shard_paths[0]) || cfg.dense_stream;
         if (!dense_.init(cfg.dense_weights, shard_paths, std::move(ranges), std::move(dense_tensors_),
                          cfg.io_backend, http_opt, already_resident)) {
             log_printf(LogLevel::Error, "dense-weights init failed");

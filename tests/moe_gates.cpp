@@ -124,6 +124,8 @@
 #include <chrono>
 #include <cmath>
 #include <cstdio>
+#include <filesystem>
+#include <fstream>
 #include <memory>
 #include <string>
 #include <thread>
@@ -520,6 +522,43 @@ int main(int argc, char ** argv) {
 
     int fails = hook_missing; // --require-hook with the hook absent: one failure before any gate
     fails += check("G1 resident == streaming(cache off)", s_res, s_s0);
+#if defined(__linux__)
+    // G1z — local --moe-stream (default dense-weights=anon) boots through llama_model_init_from_user()
+    // with zero file mmap in /proc/self/maps and produces output byte-identical to resident.
+    {
+        std::string zerr;
+        std::unique_ptr<Session> zs = Session::open(session_config_from(streamc), zerr);
+        if (!zs) {
+            std::fprintf(stderr, "G1z open failed: %s\n", zerr.c_str());
+            return 2;
+        }
+        std::ifstream maps("/proc/self/maps");
+        std::string line;
+        bool mapped = false;
+        const std::string fname = std::filesystem::path(model).filename().string();
+        while (std::getline(maps, line)) {
+            if (line.find(fname) != std::string::npos) {
+                mapped = true;
+                break;
+            }
+        }
+        if (mapped) {
+            std::printf("[FAIL] G1z local --moe-stream mapped %s in /proc/self/maps\n", fname.c_str());
+            ++fails;
+        } else {
+            std::printf("[PASS] G1z local --moe-stream: ZERO mmap of %s in /proc/self/maps\n", fname.c_str());
+        }
+        GenerateRequest req;
+        req.prompt = streamc.prompt;
+        req.n_predict = streamc.n_predict;
+        const RunResult zr = zs->generate(req);
+        if (!zr) {
+            std::fprintf(stderr, "G1z generate failed: %s\n", zr.error.c_str());
+            return 2;
+        }
+        fails += check("G1z local zero-mmap streaming == resident", s_res, zr.generated_text);
+    }
+#endif
     fails += check("G2 streaming(cache off) == streaming(LRU cache)", s_s0, s_sc);
 
     // G2l — plain LRU picks other victims from the same tiny budget than the default decayed

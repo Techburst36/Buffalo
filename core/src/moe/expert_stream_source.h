@@ -75,7 +75,8 @@ public:
               int n_expert,
               std::vector<LayerExperts> layers,
               const MoeStreamConfig & cfg,
-              std::unique_ptr<BlockProvider> preopened_provider = nullptr);
+              std::unique_ptr<BlockProvider> preopened_provider = nullptr,
+              bool dense_already_resident = false);
 
     // Supply the dense (non-expert) weight tensors the DenseWeights policy may need (only the
     // Anonymous mode reads+rebinds them). Call BEFORE init, which hands them to the dense module.

@@ -1084,6 +1084,7 @@ struct Session::Impl::Opening {
 
     ExpertLayout layout{};    // set by read_model when streaming; left !ok otherwise, and then no tensor matches it
     int n_layer_streamed = 0; // set by build_hook
+    bool used_user_loader = false; // true when load_model() booted via llama_model_init_from_user() (zero mmap)
 
     bool fail(std::string msg) {
         error = std::move(msg);
@@ -1150,11 +1151,15 @@ bool Session::Impl::load_model(Opening & o, llama_model ** reference) {
     mparams.lazy_mode =
         cfg.moe.row_stream || !cfg.moe.dense_mapped.empty() ? LLAMA_LAZY_MODE_OFF : LLAMA_LAZY_MODE_AUTO;
     const bool remote = is_remote_url(cfg.model_path);
-    // Boot through llama_model_init_from_user() + bmoe_virtual_host_buffer_type() for both remote
-    // HTTP URLs AND local --dense-stream models so Linux MAP_POPULATE / MADV_WILLNEED never faults
-    // a >RAM local GGUF into RAM at boot or during capture_warmup(). When --dense-stream is off on
-    // local files, keep the existing mmap loader untouched.
-    const bool use_user_loader = remote || cfg.moe.dense_stream;
+    // Boot through llama_model_init_from_user() + bmoe_virtual_host_buffer_type() for remote HTTP
+    // URLs, local --dense-stream models, and local --moe-stream models using anonymous dense
+    // weights (the default) so Linux MAP_POPULATE / MADV_WILLNEED never mmaps or faults a >RAM
+    // local GGUF into RAM at boot. Keep llama_model_load_from_file() when the caller explicitly
+    // asks for mmap/warmed/pinned dense weights, planner-mapped dense tables, or --row-stream.
+    const bool local_moe_user_candidate = !remote && !cfg.moe.dense_stream && cfg.moe.enabled &&
+                                          cfg.moe.dense_weights == DenseWeightsMode::Anonymous &&
+                                          cfg.moe.dense_mapped.empty() && !cfg.moe.row_stream && reference == nullptr;
+    bool use_user_loader = remote || cfg.moe.dense_stream || local_moe_user_candidate;
     std::vector<std::string> vhost_patterns;
     std::vector<llama_model_tensor_buft_override> buft_overrides;
 
@@ -1170,40 +1175,80 @@ bool Session::Impl::load_model(Opening & o, llama_model ** reference) {
             for (const std::string & pat : cfg.buft_overrides)
                 user_re.emplace_back(pat);
         }
+        auto forced_cpu = [&](const std::string & name) {
+            for (const std::regex & re : user_re)
+                if (std::regex_search(name, re)) return true;
+            return false;
+        };
 
-        // When streaming a remote MoE model, override routed expert tensors to our
+        // Mirror llama-model.cpp:1766-1791 layer-to-device split so GPU-offloaded layers stay on
+        // GPU (including their experts when not overridden to CPU) while host-streamed routed
+        // experts and streamed dense tensors land in BMOE_VirtualHost (0 bytes read, 0 RAM).
+        bool has_gpu = false;
+        if (!cpu_only && cfg.n_gpu_layers > 0 && !cfg.prefill.enabled()) {
+            if (!cfg.device_list.empty() || !cfg.device_split.empty()) {
+                has_gpu = true;
+            } else {
+                std::vector<ggml_backend_dev_t> devs_probe;
+                if (const ggml_backend_dev_t * devs = detail::PrefillPath::devices_without_prefill(devs_probe)) {
+                    has_gpu = devs[0] != nullptr;
+                } else {
+                    for (size_t i = 0; i < ggml_backend_dev_count(); ++i) {
+                        const auto ty = ggml_backend_dev_type(ggml_backend_dev_get(i));
+                        if (ty == GGML_BACKEND_DEVICE_TYPE_GPU || ty == GGML_BACKEND_DEVICE_TYPE_IGPU) {
+                            has_gpu = true;
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+        const bool load_mtp_now = cfg.spec.is_mtp() && cfg.spec.mtp_head.empty();
+        const int n_layer_trunk = std::max(0, rem.meta.info.n_block - rem.meta.info.n_nextn);
+        const int n_layer_all = load_mtp_now ? rem.meta.info.n_block : n_layer_trunk;
+        const int act_gpu_layers = has_gpu ? std::min(cfg.n_gpu_layers, n_layer_all + 1) : 0;
+        const int i_gpu_start = std::max(n_layer_all + 1 - cfg.n_gpu_layers, 0);
+
+        // When streaming a MoE model, override host-bound routed expert tensors to our
         // virtual-reservation host buffer type so llama_model_init_from_user() reserves
-        // address space with 0 physical RAM committed and fetches 0 routed expert bytes over HTTP.
+        // address space with 0 physical RAM committed and reads 0 routed expert bytes at boot.
         if (cfg.moe.enabled) {
             const ExpertLayout lay = discover_expert_layout(rem.meta.offsets.extents, rem.meta.info.n_expert);
             if (!lay.ok)
                 return o.fail("not a MoE this engine streams: " + lay.error +
                               ". Turn {moe-stream} off to run it resident (docs/which-models-stream.md).");
 
+            std::vector<std::string> matched_routed;
+            size_t total_routed = 0;
             for (const TensorExtent & ext : rem.meta.offsets.extents) {
                 int elayer = 0;
-                if (lay.slot_of(ext.name.c_str(), elayer) >= 0) routed_names.insert(ext.name);
+                if (lay.slot_of(ext.name.c_str(), elayer) < 0) continue;
+                routed_names.insert(ext.name);
+                if (!load_mtp_now && (tensor_names::is_mtp_tensor(ext.name.c_str()) || elayer >= n_layer_trunk))
+                    continue;
+                ++total_routed;
+                const bool on_gpu =
+                    act_gpu_layers > 0 && elayer >= i_gpu_start && (elayer - i_gpu_start) < act_gpu_layers;
+                if (!on_gpu || forced_cpu(ext.name)) matched_routed.push_back(ext.name);
             }
 
-            if (cfg.n_gpu_layers == 0 || cfg.buft_overrides.empty()) {
-                vhost_patterns.reserve((size_t) lay.n_slots);
-                for (int p = 0; p < lay.n_slots; ++p) {
-                    vhost_patterns.push_back("^blk\\.[0-9]+\\." + regex_escape_literal(lay.suffix[p]) + "\\.weight$");
-                }
-            } else {
-                std::vector<std::string> matched_routed;
-                size_t total_routed = 0;
-                for (const TensorExtent & ext : rem.meta.offsets.extents) {
-                    int elayer = 0;
-                    if (lay.slot_of(ext.name.c_str(), elayer) < 0) continue;
-                    ++total_routed;
-                    for (const std::regex & re : user_re) {
-                        if (std::regex_search(ext.name, re)) {
-                            matched_routed.push_back(ext.name);
+            // Guard against oversized dense tables (e.g., 28.8 GB n-gram tables exceeding RAM):
+            // fall back to mmap so DenseWeights::hold_back_oversized() keeps them demand-paged.
+            if (local_moe_user_candidate) {
+                const uint64_t avail = pio::mem_available_bytes();
+                if (avail > 0) {
+                    for (const auto & kv : rem.meta.offsets.size_by_name) {
+                        if (routed_names.count(kv.first)) continue;
+                        if (kv.second > avail) {
+                            use_user_loader = false;
+                            o.remote.provider.reset();
                             break;
                         }
                     }
                 }
+            }
+
+            if (use_user_loader) {
                 if (matched_routed.size() == total_routed && total_routed > 0) {
                     vhost_patterns.reserve((size_t) lay.n_slots);
                     for (int p = 0; p < lay.n_slots; ++p) {
@@ -1218,43 +1263,11 @@ bool Session::Impl::load_model(Opening & o, llama_model ** reference) {
             }
         }
 
-        // When dense streaming is enabled on a remote HTTP model, also override host-resident
-        // dense tensors (>= dense_min_bytes) to bmoe_virtual_host_buffer_type() so boot downloads
-        // 0 bytes of streamed dense layers while GPU-offloaded layers still load straight into VRAM.
-        if (cfg.moe.dense_stream) {
-            bool has_gpu = false;
-            if (!cpu_only && cfg.n_gpu_layers > 0 && !cfg.prefill.enabled()) {
-                if (!cfg.device_list.empty() || !cfg.device_split.empty()) {
-                    has_gpu = true;
-                } else {
-                    std::vector<ggml_backend_dev_t> devs_probe;
-                    if (const ggml_backend_dev_t * devs = detail::PrefillPath::devices_without_prefill(devs_probe)) {
-                        has_gpu = devs[0] != nullptr;
-                    } else {
-                        for (size_t i = 0; i < ggml_backend_dev_count(); ++i) {
-                            const auto ty = ggml_backend_dev_type(ggml_backend_dev_get(i));
-                            if (ty == GGML_BACKEND_DEVICE_TYPE_GPU || ty == GGML_BACKEND_DEVICE_TYPE_IGPU) {
-                                has_gpu = true;
-                                break;
-                            }
-                        }
-                    }
-                }
-            }
-            // Mirror llama-model.cpp:1766-1791 layer-to-device split exactly.
-            const bool load_mtp_now = cfg.spec.is_mtp() && cfg.spec.mtp_head.empty();
-            const int n_layer_trunk = std::max(0, rem.meta.info.n_block - rem.meta.info.n_nextn);
-            const int n_layer_all = load_mtp_now ? rem.meta.info.n_block : n_layer_trunk;
-            const int act_gpu_layers = has_gpu ? std::min(cfg.n_gpu_layers, n_layer_all + 1) : 0;
-            const int i_gpu_start = std::max(n_layer_all + 1 - cfg.n_gpu_layers, 0);
+        // When dense streaming is enabled, also override host-resident dense tensors
+        // (>= dense_min_bytes) to bmoe_virtual_host_buffer_type() so boot reads 0 bytes of
+        // streamed dense layers while GPU-offloaded layers still load straight into VRAM.
+        if (use_user_loader && cfg.moe.dense_stream) {
             const uint64_t min_bytes = (uint64_t) std::max(0, cfg.moe.dense_min_bytes);
-
-            auto forced_cpu = [&](const std::string & name) {
-                for (const std::regex & re : user_re)
-                    if (std::regex_search(name, re)) return true;
-                return false;
-            };
-
             for (const auto & kv : rem.meta.offsets.size_by_name) {
                 const std::string & name = kv.first;
                 const uint64_t sz = kv.second;
@@ -1275,6 +1288,7 @@ bool Session::Impl::load_model(Opening & o, llama_model ** reference) {
             }
         }
     }
+    o.used_user_loader = use_user_loader;
 
     if (!vhost_patterns.empty() || !cfg.buft_overrides.empty()) {
         buft_overrides.reserve(vhost_patterns.size() + cfg.buft_overrides.size() + 1);
@@ -2463,7 +2477,8 @@ bool Session::Impl::bind_streaming(Opening & o) {
         if (prefill) prefill->keep_stream_layout(layers, offs.shard_paths);
         if (prefill && cfg.prefill.slots_on_demand) prefill->share_memory_with(&source);
         if (prefill) prefill->read_experts_from(&source);
-        if (!source.init(offs.shard_paths, n_expert, std::move(layers), cfg.moe, std::move(o.remote.provider)))
+        if (!source.init(offs.shard_paths, n_expert, std::move(layers), cfg.moe, std::move(o.remote.provider),
+                         o.used_user_loader))
             return o.fail("expert stream source init failed");
         source.set_pin_floor(source.worst_cycle_bytes(n_expert_used));
         source.set_top_k(n_expert_used);
@@ -2493,8 +2508,8 @@ bool Session::Impl::bind_streaming(Opening & o) {
     }
 
     // Only release/drop file mappings when llama_model_load_from_file() actually created an mmap
-    // (remote HTTP and --dense-stream both boot via llama_model_init_from_user() with no mmap).
-    if (!is_remote_url(cfg.model_path) && !cfg.moe.dense_stream) {
+    // (user-loaded models boot via llama_model_init_from_user() with zero mmap).
+    if (!o.used_user_loader) {
         release_mapping(cfg, offs, unaccounted);
         // llama.cpp asks for the whole mapping to be read ahead at load (init_mappings prefetches every
         // non-lazy range), so the model files fill the system's page cache with bytes this run reads
