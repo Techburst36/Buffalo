@@ -62,15 +62,18 @@ bool DenseStreamSource::init(const std::vector<std::string> & shard_paths,
     auto rollback = [&]() {
         for (Group & g : groups_) {
             for (ManagedTensor & mt : g.tensors) {
-                if (mt.owns_vm) {
-                    if (mt.ref.tensor) mt.ref.tensor->data = mt.orig_data;
-                    for (size_t a = 0; a < mt.ref.aliases.size() && a < mt.alias_orig_data.size(); ++a) {
-                        if (mt.ref.aliases[a]) mt.ref.aliases[a]->data = mt.alias_orig_data[a];
-                    }
-                    if (mt.base && mt.span_bytes) pio::vm_release(mt.base, mt.span_bytes);
+                if (mt.ref.tensor) mt.ref.tensor->data = mt.orig_data;
+                for (size_t a = 0; a < mt.ref.aliases.size() && a < mt.alias_orig_data.size(); ++a) {
+                    if (mt.ref.aliases[a]) mt.ref.aliases[a]->data = mt.alias_orig_data[a];
                 }
+                if (mt.owns_vm && mt.base && mt.span_bytes) pio::vm_release(mt.base, mt.span_bytes);
             }
         }
+        for (RingSlot & rs : ring_slots_) {
+            if (rs.base && rs.alloc_bytes) pio::vm_release(rs.base, rs.alloc_bytes);
+        }
+        ring_slots_.clear();
+        use_ring_ = false;
         groups_.clear();
         tensor_to_group_.clear();
         provider_.reset();
@@ -172,6 +175,11 @@ bool DenseStreamSource::init(const std::vector<std::string> & shard_paths,
         }
     }
 
+    const size_t tensor_align =
+        std::max<size_t>(std::max<size_t>(page, provider_->buffer_align()), size_t(64));
+    chunk_bytes_ = ((chunk_bytes_ + tensor_align - 1) / tensor_align) * tensor_align;
+    if (chunk_bytes_ > k_max_chunk_bytes) chunk_bytes_ = k_max_chunk_bytes;
+
     // Size the RAM window: explicit --dense-cache-mb, or auto (minimal 2-layer look-ahead window).
     uint64_t top1 = 0, top2 = 0;
     size_t n_groups = 0;
@@ -221,6 +229,81 @@ bool DenseStreamSource::init(const std::vector<std::string> & shard_paths,
         }
     }
 
+    // Hint THP on permanent (static-pinned or fits-in-budget) spans >= 2 MiB to cut TLB misses.
+    for (Group & g : groups_) {
+        if (g.tensors.empty()) continue;
+        if (total_weight_bytes_ <= budget_bytes_ || g.static_pinned) {
+            for (ManagedTensor & mt : g.tensors) {
+                if (mt.base && mt.span_bytes >= k_hugepage_bytes) pio::vm_advise_hugepage(mt.base, mt.span_bytes);
+            }
+        }
+    }
+
+    // Pre-faulted physical ring slots for rotating tail groups: instead of calling MADV_DONTNEED
+    // on every layer eviction (which forces the kernel to unmap, re-allocate, zero-fill, and
+    // fault every 4 KiB page on the next token sweep), allocate 1-2 physical slots aligned to
+    // 2 MiB with MADV_HUGEPAGE and pre-fault them once at init. Rotating tail groups recycle
+    // these hot physical buffers and retarget tensor->data on the eval thread before compute,
+    // incurring zero minor page faults on steady-state sweeps.
+    use_ring_ = false;
+    ring_slots_.clear();
+    if (total_weight_bytes_ > budget_bytes_) {
+        size_t n_rotating = 0;
+        uint64_t max_tail_slot_bytes = 0;
+        uint64_t max_tail_weight_bytes = 0;
+        for (Group & g : groups_) {
+            if (g.tensors.empty() || g.static_pinned) continue;
+            ++n_rotating;
+            size_t cur_off = 0;
+            for (ManagedTensor & mt : g.tensors) {
+                mt.slot_offset = cur_off;
+                const size_t packed = (((size_t) mt.ref.size + tail + tensor_align - 1) / tensor_align) * tensor_align;
+                cur_off += packed;
+            }
+            g.slot_bytes = (uint64_t) cur_off;
+            if (g.slot_bytes > max_tail_slot_bytes) max_tail_slot_bytes = g.slot_bytes;
+            if (g.total_bytes > max_tail_weight_bytes) max_tail_weight_bytes = g.total_bytes;
+        }
+        if (n_rotating > 0 && max_tail_slot_bytes > 0) {
+            const int num_slots =
+                (n_rotating >= 2 && budget_bytes_ >= static_pinned_bytes_ + 2 * max_tail_weight_bytes) ? 2 : 1;
+            const size_t slot_align = max_tail_slot_bytes >= k_hugepage_bytes ? k_hugepage_bytes : page;
+            const size_t alloc_bytes =
+                (((size_t) max_tail_slot_bytes + slot_align - 1) / slot_align) * slot_align;
+            bool ring_ok = true;
+            ring_slots_.reserve((size_t) num_slots);
+            for (int s = 0; s < num_slots; ++s) {
+                void * base = pio::vm_reserve_aligned(alloc_bytes, slot_align);
+                if (!base) {
+                    ring_ok = false;
+                    break;
+                }
+                if (alloc_bytes >= k_hugepage_bytes) pio::vm_advise_hugepage(base, alloc_bytes);
+                if (!pio::vm_commit(base, alloc_bytes)) {
+                    pio::vm_release(base, alloc_bytes);
+                    ring_ok = false;
+                    break;
+                }
+                // Pre-fault every page once so steady-state O_DIRECT / io_uring / pread writes
+                // hit hot resident PTEs/PMDs with zero minor page faults.
+                auto * touch = static_cast<volatile uint8_t *>(base);
+                for (size_t off = 0; off < alloc_bytes; off += page)
+                    touch[off] = 0;
+                ring_slots_.push_back(RingSlot{base, alloc_bytes, -1});
+            }
+            if (ring_ok && !ring_slots_.empty()) {
+                use_ring_ = true;
+            } else {
+                for (RingSlot & rs : ring_slots_)
+                    if (rs.base && rs.alloc_bytes) pio::vm_release(rs.base, rs.alloc_bytes);
+                ring_slots_.clear();
+                log_printf(LogLevel::Warn,
+                           "dense-stream: could not allocate %d x %.2f MiB physical ring slots — falling back to VM evict",
+                           num_slots, (double) alloc_bytes / (1024.0 * 1024.0));
+            }
+        }
+    }
+
     fatal_.store(false, std::memory_order_relaxed);
     prefetch_stop_ = false;
     prefetch_target_ = -1;
@@ -238,11 +321,13 @@ bool DenseStreamSource::init(const std::vector<std::string> & shard_paths,
 
     log_printf(LogLevel::Info,
                "dense-stream: %zu tensor(s) in %zu group(s), %.2f MiB total, budget %.2f MiB (%s), "
-               "static-pinned %.2f MiB (%llu group(s)), provider=%s%s%llu MiB mmap dropped",
+               "static-pinned %.2f MiB (%llu group(s)), ring=%zux%.2f MiB, provider=%s, %llu MiB mmap dropped",
                n_tensors, n_groups, (double) total_weight_bytes_ / (1024.0 * 1024.0),
                (double) budget_bytes_ / (1024.0 * 1024.0), cfg.dense_cache_mb > 0 ? "explicit" : "auto 2-layer",
                (double) static_pinned_bytes_ / (1024.0 * 1024.0), (unsigned long long) static_pinned_groups_,
-               provider_->backend_name(), dropped_mmap ? ", " : ", ", (unsigned long long) (dropped_mmap >> 20));
+               ring_slots_.size(),
+               ring_slots_.empty() ? 0.0 : (double) ring_slots_[0].alloc_bytes / (1024.0 * 1024.0),
+               provider_->backend_name(), (unsigned long long) (dropped_mmap >> 20));
     return true;
 }
 
@@ -257,17 +342,23 @@ void DenseStreamSource::shutdown() {
 
     std::lock_guard<std::mutex> lk(mtx_);
     for (Group & g : groups_) {
-        if (g.state == GroupState::Resident) evict_group_vm(g);
+        if (g.state == GroupState::Resident && g.slot_idx < 0) evict_group_vm(g);
+        g.slot_idx = -1;
         for (ManagedTensor & mt : g.tensors) {
-            if (mt.owns_vm) {
-                if (mt.ref.tensor) mt.ref.tensor->data = mt.orig_data;
-                for (size_t a = 0; a < mt.ref.aliases.size() && a < mt.alias_orig_data.size(); ++a) {
-                    if (mt.ref.aliases[a]) mt.ref.aliases[a]->data = mt.alias_orig_data[a];
-                }
-                if (mt.base && mt.span_bytes) pio::vm_release(mt.base, mt.span_bytes);
+            // Unconditionally restore original tensor->data (and aliases) before releasing ring
+            // slots or private VM reservations so llama_model_free() sees valid original pointers.
+            if (mt.ref.tensor) mt.ref.tensor->data = mt.orig_data;
+            for (size_t a = 0; a < mt.ref.aliases.size() && a < mt.alias_orig_data.size(); ++a) {
+                if (mt.ref.aliases[a]) mt.ref.aliases[a]->data = mt.alias_orig_data[a];
             }
+            if (mt.owns_vm && mt.base && mt.span_bytes) pio::vm_release(mt.base, mt.span_bytes);
         }
     }
+    for (RingSlot & rs : ring_slots_) {
+        if (rs.base && rs.alloc_bytes) pio::vm_release(rs.base, rs.alloc_bytes);
+    }
+    ring_slots_.clear();
+    use_ring_ = false;
     groups_.clear();
     tensor_to_group_.clear();
     provider_.reset();
@@ -321,6 +412,81 @@ void DenseStreamSource::evict_group_vm(Group & g) {
     }
 }
 
+void DenseStreamSource::evict_group_locked(Group & vg) {
+    if (vg.slot_idx >= 0) {
+        // Logical ring-slot eviction: keep the pre-faulted physical pages hot and mapped so the
+        // next rotating layer overwrites them with zero MADV_DONTNEED and zero minor page faults.
+        RingSlot & rs = ring_slots_[(size_t) vg.slot_idx];
+        if (rs.owner_group == vg.id) rs.owner_group = -1;
+        vg.slot_idx = -1;
+    } else {
+        evict_group_vm(vg);
+    }
+    vg.state = GroupState::Evicted;
+    vg.prefetched = false;
+    resident_bytes_ = resident_bytes_ >= vg.total_bytes ? (resident_bytes_ - vg.total_bytes) : 0;
+    ++groups_evicted_;
+}
+
+void DenseStreamSource::bind_group_ptrs_locked(Group & g) {
+    // Always called on the eval thread before compute for `g` begins (never from the prefetch thread).
+    char * slot_base = (g.slot_idx >= 0 && g.slot_idx < (int) ring_slots_.size())
+                           ? static_cast<char *>(ring_slots_[(size_t) g.slot_idx].base)
+                           : nullptr;
+    for (ManagedTensor & mt : g.tensors) {
+        void * ptr = slot_base ? static_cast<void *>(slot_base + mt.slot_offset) : mt.base;
+        if (mt.ref.tensor) mt.ref.tensor->data = ptr;
+        for (ggml_tensor * al : mt.ref.aliases)
+            if (al) al->data = ptr;
+    }
+}
+
+int DenseStreamSource::find_evictable_slot_locked() const {
+    for (int s = 0; s < (int) ring_slots_.size(); ++s) {
+        if (ring_slots_[(size_t) s].owner_group < 0) return s;
+    }
+    int best_slot = -1;
+    uint64_t oldest = UINT64_MAX;
+    for (int s = 0; s < (int) ring_slots_.size(); ++s) {
+        const int og = ring_slots_[(size_t) s].owner_group;
+        if (og < 0 || og >= (int) groups_.size()) return s;
+        const Group & g = groups_[(size_t) og];
+        if (g.state == GroupState::Resident && !g.pinned && !g.static_pinned && g.lru_tick < oldest) {
+            oldest = g.lru_tick;
+            best_slot = s;
+        }
+    }
+    return best_slot;
+}
+
+bool DenseStreamSource::any_slot_loading_locked() const {
+    for (const RingSlot & rs : ring_slots_) {
+        if (rs.owner_group >= 0 && rs.owner_group < (int) groups_.size() &&
+            groups_[(size_t) rs.owner_group].state == GroupState::Loading) {
+            return true;
+        }
+    }
+    return false;
+}
+
+int DenseStreamSource::acquire_ring_slot_locked(Group & g) {
+    const int s = find_evictable_slot_locked();
+    if (s < 0) return -1;
+    const int prev = ring_slots_[(size_t) s].owner_group;
+    if (prev >= 0 && prev < (int) groups_.size()) {
+        Group & vg = groups_[(size_t) prev];
+        if (vg.state == GroupState::Resident) {
+            evict_group_locked(vg);
+        } else {
+            ring_slots_[(size_t) s].owner_group = -1;
+            vg.slot_idx = -1;
+        }
+    }
+    ring_slots_[(size_t) s].owner_group = g.id;
+    g.slot_idx = s;
+    return s;
+}
+
 uint64_t DenseStreamSource::unevictable_bytes_locked() const {
     uint64_t sum = 0;
     for (const Group & g : groups_) {
@@ -342,28 +508,33 @@ void DenseStreamSource::evict_unpinned_locked(uint64_t need_bytes) {
             }
         }
         if (victim < 0) break; // only pinned/static-pinned/loading groups remain; never evict them
-        Group & vg = groups_[(size_t) victim];
-        evict_group_vm(vg);
-        vg.state = GroupState::Evicted;
-        vg.prefetched = false;
-        resident_bytes_ = resident_bytes_ >= vg.total_bytes ? (resident_bytes_ - vg.total_bytes) : 0;
-        ++groups_evicted_;
+        evict_group_locked(groups_[(size_t) victim]);
     }
 }
 
-bool DenseStreamSource::load_group_io(Group & g, uint64_t & out_bytes_read) {
+bool DenseStreamSource::load_group_io(Group & g, int slot_idx, uint64_t & out_bytes_read) {
     out_bytes_read = 0;
     if (!provider_) return false;
+
+    char * slot_base = (slot_idx >= 0 && slot_idx < (int) ring_slots_.size())
+                           ? static_cast<char *>(ring_slots_[(size_t) slot_idx].base)
+                           : nullptr;
 
     std::vector<BlockReadReq> reqs;
     reqs.reserve(g.tensors.size());
 
     for (ManagedTensor & mt : g.tensors) {
-        if (!mt.base || mt.span_bytes == 0) continue;
-        if (!pio::vm_commit(mt.base, mt.span_bytes)) {
-            log_printf(LogLevel::Error, "dense-stream: vm_commit(%zu) failed for %s", mt.span_bytes,
-                       mt.ref.tensor ? mt.ref.tensor->name : "?");
-            return false;
+        char * dst_base = nullptr;
+        if (slot_base) {
+            dst_base = slot_base + mt.slot_offset;
+        } else {
+            if (!mt.base || mt.span_bytes == 0) continue;
+            if (!pio::vm_commit(mt.base, mt.span_bytes)) {
+                log_printf(LogLevel::Error, "dense-stream: vm_commit(%zu) failed for %s", mt.span_bytes,
+                           mt.ref.tensor ? mt.ref.tensor->name : "?");
+                return false;
+            }
+            dst_base = static_cast<char *>(mt.base);
         }
         for (uint64_t off = 0; off < mt.ref.size;) {
             const uint64_t len = std::min<uint64_t>(chunk_bytes_, mt.ref.size - off);
@@ -371,7 +542,7 @@ bool DenseStreamSource::load_group_io(Group & g, uint64_t & out_bytes_read) {
             r.shard = mt.ref.file_idx;
             r.off = mt.ref.file_off + off;
             r.nbytes = len;
-            r.dst = static_cast<char *>(mt.base) + off;
+            r.dst = dst_base + off;
             reqs.push_back(r);
             off += len;
         }
@@ -391,35 +562,50 @@ bool DenseStreamSource::ensure_group_pinned(int g) {
     if (!active_ || g < 0 || g >= (int) groups_.size()) return true;
     if (fatal_.load(std::memory_order_relaxed)) return false;
 
+    int slot_idx = -1;
     {
         std::unique_lock<std::mutex> lk(mtx_);
         Group & grp = groups_[(size_t) g];
         if (grp.tensors.empty()) return true;
 
-        // Wait if an async prefetch for this group is currently in flight.
-        while (grp.state == GroupState::Loading) {
-            cv_.wait(lk);
-        }
-
-        if (grp.state == GroupState::Resident) {
-            if (grp.prefetched) {
-                ++prefetch_hits_;
-                grp.prefetched = false;
+        for (;;) {
+            // Wait if an async prefetch for this group is currently in flight.
+            while (grp.state == GroupState::Loading) {
+                cv_.wait(lk);
             }
-            grp.pinned = true;
-            grp.lru_tick = ++lru_tick_;
-            return true;
-        }
 
-        // Synchronous miss: evict oldest unpinned groups, mark Loading + pinned, release lock for I/O.
-        grp.state = GroupState::Loading;
-        grp.pinned = true;
-        grp.prefetched = false;
-        evict_unpinned_locked(grp.total_bytes);
+            if (grp.state == GroupState::Resident) {
+                if (grp.prefetched) {
+                    ++prefetch_hits_;
+                    grp.prefetched = false;
+                }
+                grp.pinned = true;
+                grp.lru_tick = ++lru_tick_;
+                bind_group_ptrs_locked(grp);
+                return true;
+            }
+
+            if (use_ring_ && !grp.static_pinned) {
+                slot_idx = acquire_ring_slot_locked(grp);
+                if (slot_idx < 0 && any_slot_loading_locked()) {
+                    // Wait for an in-flight prefetch of another group to finish and become evictable.
+                    cv_.wait(lk);
+                    continue;
+                }
+            }
+
+            // Synchronous miss: evict oldest unpinned groups, mark Loading + pinned, release lock for I/O.
+            grp.state = GroupState::Loading;
+            grp.pinned = true;
+            grp.prefetched = false;
+            grp.slot_idx = slot_idx;
+            evict_unpinned_locked(grp.total_bytes);
+            break;
+        }
     }
 
     uint64_t read_b = 0;
-    const bool ok = load_group_io(groups_[(size_t) g], read_b);
+    const bool ok = load_group_io(groups_[(size_t) g], slot_idx, read_b);
 
     {
         std::lock_guard<std::mutex> lk(mtx_);
@@ -431,8 +617,14 @@ bool DenseStreamSource::ensure_group_pinned(int g) {
             if (resident_bytes_ > peak_resident_bytes_) peak_resident_bytes_ = resident_bytes_;
             bytes_read_ += read_b;
             ++groups_loaded_;
+            bind_group_ptrs_locked(grp);
         } else {
-            evict_group_vm(grp);
+            if (slot_idx >= 0) {
+                ring_slots_[(size_t) slot_idx].owner_group = -1;
+                grp.slot_idx = -1;
+            } else {
+                evict_group_vm(grp);
+            }
             grp.state = GroupState::Evicted;
             grp.pinned = false;
             ++io_errors_;
@@ -484,8 +676,16 @@ void DenseStreamSource::prefetch_group_async(int next_g) {
         // Under extreme 1-layer budgets this cleanly disables look-ahead instead of thrashing.
         if (unevictable_bytes_locked() + grp.total_bytes > budget_bytes_) return;
 
+        int slot_idx = -1;
+        if (use_ring_ && !grp.static_pinned) {
+            slot_idx = acquire_ring_slot_locked(grp);
+            if (slot_idx < 0) return; // all ring slots currently pinned/loading; skip look-ahead
+        }
+
         grp.state = GroupState::Loading;
         grp.prefetched = true;
+        grp.slot_idx = slot_idx;
+        evict_unpinned_locked(grp.total_bytes);
         prefetch_target_ = next_g;
     }
     prefetch_cv_.notify_one();
@@ -494,19 +694,18 @@ void DenseStreamSource::prefetch_group_async(int next_g) {
 void DenseStreamSource::prefetch_worker_main() {
     for (;;) {
         int target = -1;
+        int slot_idx = -1;
         {
             std::unique_lock<std::mutex> lk(mtx_);
             prefetch_cv_.wait(lk, [this] { return prefetch_stop_ || prefetch_target_ >= 0; });
             if (prefetch_stop_) break;
             target = prefetch_target_;
             prefetch_target_ = -1;
-
-            Group & grp = groups_[(size_t) target];
-            evict_unpinned_locked(grp.total_bytes);
+            slot_idx = groups_[(size_t) target].slot_idx;
         }
 
         uint64_t read_b = 0;
-        const bool ok = load_group_io(groups_[(size_t) target], read_b);
+        const bool ok = load_group_io(groups_[(size_t) target], slot_idx, read_b);
 
         {
             std::lock_guard<std::mutex> lk(mtx_);
@@ -519,7 +718,12 @@ void DenseStreamSource::prefetch_worker_main() {
                 bytes_read_ += read_b;
                 ++groups_loaded_;
             } else {
-                evict_group_vm(grp);
+                if (slot_idx >= 0) {
+                    ring_slots_[(size_t) slot_idx].owner_group = -1;
+                    grp.slot_idx = -1;
+                } else {
+                    evict_group_vm(grp);
+                }
                 grp.state = GroupState::Evicted;
                 grp.prefetched = false;
                 ++io_errors_;

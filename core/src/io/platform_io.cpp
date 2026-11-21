@@ -145,6 +145,10 @@ size_t vm_page() {
 void * vm_reserve(size_t sz) {
     return VirtualAlloc(nullptr, sz, MEM_RESERVE, PAGE_READWRITE);
 }
+void * vm_reserve_aligned(size_t sz, size_t /*align*/) {
+    return vm_reserve(sz);
+}
+void vm_advise_hugepage(void * /*p*/, size_t /*sz*/) {}
 bool vm_commit(void * p, size_t sz) {
     return VirtualAlloc(p, sz, MEM_COMMIT, PAGE_READWRITE) != nullptr;
 }
@@ -265,6 +269,9 @@ uint64_t mem_total_bytes() {
 uint64_t major_faults() {
     return 0;
 }
+uint64_t minor_faults() {
+    return 0;
+}
 bool major_faults_counted() {
     return false;
 }
@@ -375,6 +382,30 @@ void * vm_reserve(size_t sz) {
     // overcommit would do, refusing a reservation the cache never intends to fill).
     void * p = mmap(nullptr, sz, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0);
     return p == MAP_FAILED ? nullptr : p;
+}
+void * vm_reserve_aligned(size_t sz, size_t align) {
+    if (sz == 0) return nullptr;
+    const size_t page = vm_page();
+    sz = ((sz + page - 1) / page) * page;
+    if (align <= page || (align & (align - 1)) != 0) return vm_reserve(sz);
+    if (sz > SIZE_MAX - align) return nullptr;
+    void * raw = mmap(nullptr, sz + align, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0);
+    if (raw == MAP_FAILED) return nullptr;
+    const uintptr_t base = (uintptr_t) raw;
+    const uintptr_t aligned = (base + align - 1) & ~(uintptr_t) (align - 1);
+    const size_t lead = (size_t) (aligned - base);
+    const size_t trail = align - lead;
+    if (lead) munmap(raw, lead);
+    if (trail) munmap((void *) (aligned + sz), trail);
+    return (void *) aligned;
+}
+void vm_advise_hugepage(void * p, size_t sz) {
+#if defined(__linux__) && defined(MADV_HUGEPAGE)
+    if (p && sz) madvise(p, sz, MADV_HUGEPAGE);
+#else
+    (void) p;
+    (void) sz;
+#endif
 }
 bool vm_commit(void * /*p*/, size_t /*sz*/) {
     return true; // POSIX commits on first touch
@@ -627,6 +658,10 @@ uint64_t major_faults() {
     // RUSAGE_SELF aggregates every thread of the process, matching the multi-threaded decode.
     struct rusage ru;
     return getrusage(RUSAGE_SELF, &ru) == 0 ? (uint64_t) ru.ru_majflt : 0;
+}
+uint64_t minor_faults() {
+    struct rusage ru;
+    return getrusage(RUSAGE_SELF, &ru) == 0 ? (uint64_t) ru.ru_minflt : 0;
 }
 bool major_faults_counted() {
     return true;

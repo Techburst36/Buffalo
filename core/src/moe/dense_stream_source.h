@@ -4,11 +4,11 @@
 // output head, non-row-streamed embeddings) on demand over any BlockProvider (Posix, io_uring,
 // or HttpRangeProvider) inside a bounded RAM budget, with async 1-layer look-ahead prefetch.
 //
-// Each managed tensor keeps a stable, disjoint, OS-page-aligned virtual address for the lifetime
-// of the session (reusing bmoe_virtual_host_buffer_type() when already backed by it, or privately
-// reserved via pio::vm_reserve() otherwise). Groups are committed and filled via one batched
-// BlockProvider::read_batch() call before execution, pinned while their layer computes, and
-// evicted back to uncommitted virtual memory via pio::vm_evict() under LRU budget pressure.
+// Each static-pinned (or fits-in-budget) tensor keeps a stable, disjoint, OS-page-aligned virtual
+// address for the lifetime of the session. Rotating unpinned tail groups share a small pool of
+// pre-faulted, 2 MiB-aligned THP-backed physical ring slots sized to the rotating window (1-2 x
+// max tail group): evicting a tail group logically recycles its ring slot and retargets tensor->data
+// on the eval thread before compute, eliminating per-sweep MADV_DONTNEED and 4 KiB page-fault churn.
 #pragma once
 
 #include "../io/block_provider.h"
@@ -98,6 +98,7 @@ private:
         void * orig_data = nullptr;
         std::vector<void *> alias_orig_data;
         size_t span_bytes = 0;
+        size_t slot_offset = 0; // byte offset inside a physical ring slot (when rotating)
         bool owns_vm = false;
     };
 
@@ -108,6 +109,8 @@ private:
         std::vector<ManagedTensor> tensors;
         uint64_t total_bytes = 0;
         uint64_t span_bytes = 0;
+        uint64_t slot_bytes = 0; // packed ring-slot footprint (with per-tensor alignment & tail slack)
+        int slot_idx = -1;       // assigned physical ring slot index, or -1 if using permanent mt.base
         GroupState state = GroupState::Evicted;
         bool pinned = false;
         bool static_pinned = false; // permanently pinned prefix group; loaded once, never evicted
@@ -115,15 +118,28 @@ private:
         uint64_t lru_tick = 0;
     };
 
+    struct RingSlot {
+        void * base = nullptr;
+        size_t alloc_bytes = 0;
+        int owner_group = -1;
+    };
+
     static constexpr size_t k_max_chunk_bytes = 4ull << 20; // 4 MiB max read chunk / bounce size
+    static constexpr size_t k_hugepage_bytes = 2ull << 20;  // 2 MiB THP alignment granule on Linux
 
     void evict_group_vm(Group & g);
+    void evict_group_locked(Group & g);
     void evict_unpinned_locked(uint64_t need_bytes);
+    void bind_group_ptrs_locked(Group & g);
+    int find_evictable_slot_locked() const;
+    bool any_slot_loading_locked() const;
+    int acquire_ring_slot_locked(Group & g);
     uint64_t unevictable_bytes_locked() const;
-    bool load_group_io(Group & g, uint64_t & out_bytes_read);
+    bool load_group_io(Group & g, int slot_idx, uint64_t & out_bytes_read);
     void prefetch_worker_main();
 
     bool active_ = false;
+    bool use_ring_ = false;
     int n_layer_ = 0;
     int embd_group_ = -1;
     int head_group_ = -1;
@@ -132,6 +148,7 @@ private:
 
     std::unique_ptr<BlockProvider> provider_;
     std::vector<Group> groups_;
+    std::vector<RingSlot> ring_slots_;
     std::unordered_map<const ggml_tensor *, int> tensor_to_group_;
 
     uint64_t total_weight_bytes_ = 0;

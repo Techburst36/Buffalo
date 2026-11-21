@@ -199,6 +199,12 @@ inline size_t tensor_tail_slack() {
     return vm_page();
 }
 void * vm_reserve(size_t sz);
+// Reserve an anonymous region whose base is aligned to `align` (a power of two >= vm_page(),
+// e.g. 2 MiB for THP-backed ring buffers). Free with vm_release(p, rounded_sz).
+void * vm_reserve_aligned(size_t sz, size_t align);
+// Hint to the kernel to back [p, p+sz) with transparent huge pages (MADV_HUGEPAGE on Linux).
+// Advice only; a no-op where unsupported.
+void vm_advise_hugepage(void * p, size_t sz);
 bool vm_commit(void * p, size_t sz);
 // Ask the kernel to keep a committed span in RAM: not swapped, not compressed. False where the
 // platform refuses (a locked-memory limit, or no such call), and the span is then ordinary memory.
@@ -352,6 +358,7 @@ uint64_t mem_total_bytes();
 //     cpu≪wall×threads means the threads were descheduled or blocked (frequency cap, preemption,
 //     fault wait) rather than computing.
 uint64_t major_faults();
+uint64_t minor_faults();
 double process_cpu_seconds();
 // Whether major_faults() counts anything here. Where it does not (no per-process count of HARD
 // faults is published), a 0 is "unmeasured", and a report must not print it as "no faults".

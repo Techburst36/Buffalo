@@ -1549,27 +1549,45 @@ bool RouterHook::on_eval(ggml_tensor * t, bool ask) {
 
     // ── layer-wise dense weight streaming (--dense-stream) ──
     // On ask == true: before ggml executes node `t`, pin every streamed dense group referenced
-    // by `t`'s inputs (walking view_src chains to weight leaves) and enqueue async look-ahead for
+    // by `t` or its inputs (walking view_src chains to weight leaves), refresh any view->data
+    // pointers into the group's active physical ring slot, and enqueue async look-ahead for
     // the next group in forward order. Isolate layer-end nodes (`last_node_[nl]`) and non-block
     // nodes (token_embd / output.weight) so ask == false runs right after compute synchronizes.
     bool dense_iso = false;
     const bool dense_on = dense_source_ && dense_source_->active();
     if (dense_on && ask) {
-        for (int s = 0; s < GGML_MAX_SRC; ++s) {
-            ggml_tensor * leaf = t->src[s];
-            if (!leaf) continue;
+        auto pin_and_rebind = [&](ggml_tensor * arg) {
+            if (!arg) return;
+            ggml_tensor * chain[16];
+            int depth = 0;
+            ggml_tensor * leaf = arg;
+            while (leaf->view_src && depth < 16) {
+                chain[depth++] = leaf;
+                leaf = leaf->view_src;
+            }
             while (leaf->view_src)
                 leaf = leaf->view_src;
             const int g = dense_source_->group_of(leaf);
-            if (g < 0) continue;
+            if (g < 0) return;
             if (std::find(dense_active_.begin(), dense_active_.end(), g) == dense_active_.end()) {
                 dense_source_->ensure_group_pinned(g);
                 dense_active_.push_back(g);
                 const int next_g = dense_source_->next_group_after(g, t->op == GGML_OP_GET_ROWS);
                 if (next_g >= 0) dense_source_->prefetch_group_async(next_g);
             }
+            // Recompute view->data top-down from leaf->data so views/reshapes/transposes created
+            // at graph-allocation time always track the group's current physical ring slot.
+            for (int i = depth - 1; i >= 0; --i) {
+                ggml_tensor * v = chain[i];
+                if (v->view_src && v->view_src->data) {
+                    v->data = static_cast<char *>(v->view_src->data) + v->view_offs;
+                }
+            }
             if (g >= dense_source_->n_layer()) dense_iso = true;
-        }
+        };
+        if (t->view_src) pin_and_rebind(t);
+        for (int s = 0; s < GGML_MAX_SRC; ++s)
+            pin_and_rebind(t->src[s]);
         const int nl = tn::any_node_layer(t->name);
         if (nl >= 0 && nl < (int) last_node_.size() && !last_node_[(size_t) nl].empty() &&
             last_node_[(size_t) nl] == t->name &&

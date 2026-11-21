@@ -473,6 +473,23 @@ void test_pure_dense_local(const std::string & qwen3_path, GenCapture & out_base
                   std::string(bname) + " 10MiB: static pinning strictly reduced bytes_read vs 6 MiB and cyclic scan");
             check(st.groups_evicted > 0 && st.prefetch_hits > 0 && st.io_errors == 0,
                   std::string(bname) + " 10MiB: rotating tail evicted & prefetched cleanly with 0 errors");
+
+#if defined(__linux__)
+            // Steady-state minor page fault proof: ring slots and static-pinned prefix layers are
+            // now hot from the run above. Run a second 12-token sweep (~175+ MiB of rotating reads,
+            // which previously triggered ~45,000+ 4 KiB minor faults via MADV_DONTNEED) and verify
+            // minor page faults remain near zero.
+            const uint64_t mf_before = pio::minor_faults();
+            const uint64_t bytes_before = sess->dense_stream_stats().bytes_read;
+            RunResult r2 = sess->generate(req, [](const TokenMetrics &) {});
+            const uint64_t mf_delta = pio::minor_faults() - mf_before;
+            const uint64_t bytes_delta = sess->dense_stream_stats().bytes_read - bytes_before;
+            std::printf("  [%s 10MiB steady-state] streamed=%.2f MiB, minor_faults=%llu\n", bname,
+                        bytes_delta / 1048576.0, (unsigned long long) mf_delta);
+            check(r2.ok && bytes_delta > (100ull << 20) && mf_delta < 512,
+                  std::string(bname) + " 10MiB: steady-state rotating sweeps incur ~0 minor page faults (" +
+                      std::to_string(mf_delta) + ")");
+#endif
         }
     }
 
