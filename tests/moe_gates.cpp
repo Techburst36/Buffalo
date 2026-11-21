@@ -2241,6 +2241,75 @@ int main(int argc, char ** argv) {
                     }
                 }
             }
+
+            // (3) G25g exclusive VRAM/RAM caching parity + combined working-set proof:
+            //     Both cpu_share=0.0 (RAM->VRAM promotion handoff + cold-admit prefill) and
+            //     cpu_share=0.5 (strict exclusivity: VRAM fills dropped, CPU misses retained) must
+            //     be exact token- and logprob-identical to the unstreamed reference across wide
+            //     prefill + multi-turn decode with both tiers below the full expert set.
+            {
+                const RunConfig ref0 = make_gpu_cfg(false, 4, 0.0f, 0, 0);
+                const RunConfig str0 = make_gpu_cfg(true, 4, 0.0f, 4, 0);
+                RunResult rr0, rs0;
+                LogprobReadSink sk_r0, sk_s0;
+                if (!run_with_logprobs(ref0, rr0, sk_r0) || !run_with_logprobs(str0, rs0, sk_s0)) {
+                    std::printf("[FAIL] G25g exclusive VRAM/RAM run failed (%s): %s\n", gpu.c_str(), err.c_str());
+                    ++fails;
+                } else {
+                    fails += check("G25g exclusive VRAM/RAM (cpu_share=0, 4+4 MiB) == unstreamed reference",
+                                   rr0.generated_text, rs0.generated_text);
+                    bool lp_ok = sk_r0.logprobs.size() == sk_s0.logprobs.size() && !sk_r0.logprobs.empty();
+                    for (size_t i = 0; lp_ok && i < sk_r0.logprobs.size(); ++i)
+                        if (sk_r0.logprobs[i] != sk_s0.logprobs[i]) lp_ok = false;
+                    if (!lp_ok) {
+                        std::printf("[FAIL] G25g exclusive VRAM/RAM logprobs diverged (%s)\n", gpu.c_str());
+                        ++fails;
+                    } else {
+                        std::printf("[PASS] G25g exclusive VRAM/RAM exact logprob parity (%zu tokens, read=%.3f MiB)\n",
+                                    sk_s0.logprobs.size(), rs0.summary.moe_read_mib);
+                    }
+                }
+
+                // Multi-turn combined tier check: with vram=4 MiB + host=4 MiB (each smaller than
+                // the full expert set, combined >= expert set) and cpu_share=0.5, Turn 2 must
+                // produce identical output while cutting flash reads sharply via combined residency.
+                RunConfig comb = make_gpu_cfg(true, 4, 0.5f, 4, 0);
+                comb.prompt = "Hello world!";
+                comb.n_predict = 24;
+                std::unique_ptr<Session> s_comb = Session::open(session_config_from(comb), err);
+                if (!s_comb) {
+                    std::printf("[FAIL] G25g combined-tier session open failed (%s): %s\n", gpu.c_str(), err.c_str());
+                    ++fails;
+                } else {
+                    GenerateRequest req;
+                    req.prompt = comb.prompt;
+                    req.n_predict = comb.n_predict;
+                    req.clear_kv = true;
+                    LogprobReadSink sc1, sc2;
+                    const RunResult rc1 = s_comb->generate(req, nullptr, &sc1);
+                    const RunResult rc2 = s_comb->generate(req, nullptr, &sc2);
+                    if (!rc1 || !rc2) {
+                        std::printf("[FAIL] G25g combined-tier generate failed: %s\n",
+                                    !rc1 ? rc1.error.c_str() : rc2.error.c_str());
+                        ++fails;
+                    } else {
+                        fails += check("G25g exclusive combined tier turn2 == turn1", rc1.generated_text,
+                                       rc2.generated_text);
+                        const double m1 = rc1.summary.prefill_read_mib + rc1.summary.moe_read_mib;
+                        const double m2 = rc2.summary.prefill_read_mib + rc2.summary.moe_read_mib;
+                        if (!(m1 > 0.0 && m2 < m1)) {
+                            std::printf("[FAIL] G25g combined VRAM+RAM tier did not reduce Turn 2 reads "
+                                        "(turn1=%.3f MiB, turn2=%.3f MiB)\n",
+                                        m1, m2);
+                            ++fails;
+                        } else {
+                            std::printf("[PASS] G25g exclusive VRAM+RAM combined tier: turn1=%.3f MiB -> "
+                                        "turn2=%.3f MiB\n",
+                                        m1, m2);
+                        }
+                    }
+                }
+            }
         }
     }
 

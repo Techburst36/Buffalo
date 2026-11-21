@@ -152,6 +152,17 @@ public:
     // a wide graph (cache_prefill_cold) from a decode or a verify window. Before the first decode.
     void set_top_k(int k) { top_k_ = std::max(0, k); }
 
+    // Exclusive VRAM/RAM caching coordination when llama_moe_cache is active alongside host
+    // streaming. When enabled, experts promoted from host RAM into VRAM (and all VRAM fills once
+    // device_cache_cpu_share begins routing misses to CPU) are released from host RAM after the
+    // backend synchronizes on the next miss callback, preventing host RAM from mirroring experts
+    // already resident in VRAM and combining both tiers into a larger distinct working set.
+    void set_device_cache_exclusive(bool on, size_t device_cache_bytes = 0);
+    void set_batch_tokens(int n_tokens) { batch_tokens_ = n_tokens > 0 ? n_tokens : 1; }
+    void register_device_cpu_map(int il, const int32_t * data, int n_expert);
+    bool load_layer_device_miss(int il, const int32_t * ids, int n_ids);
+    long long vram_handoffs() const { return vram_handoffs_; }
+
     // Where projection p of expert e of layer il sits in the cache, or null when it is not resident
     // (or there is no cache). `bytes` is the slice's size. For readers on other threads while a
     // device graph runs: the eval thread is inside that graph, which reads its experts from the
@@ -245,6 +256,7 @@ private:
     // mgmt_ns_. Pure telemetry — it feeds nothing, the governor that once consumed it is gone.
     void maybe_sample_dense();
 
+    bool load_layer_impl(int il, const int32_t * ids, int n_ids, bool device_miss);
     bool load_layer_async(int il, const int32_t * ids, int n_ids); // overlap path
     void build_ready_map();                                        // overlap's readiness cells and tensor map
 
@@ -263,7 +275,12 @@ private:
     // afterwards anyway (the overlap path's token-major promote loop); a miss is always linked.
     // `commit_only_proj` >= 0 commits only that projection's pages on a miss (two-wave publish:
     // the caller contracts to commit the rest via commit_proj_pages before emitting their jobs).
-    bool touch_entry(int il, int e, bool & hit, bool promote = true, int commit_only_proj = -1);
+    bool touch_entry(int il,
+                     int e,
+                     bool & hit,
+                     bool promote = true,
+                     int commit_only_proj = -1,
+                     bool touch_freq = true);
 
     // Commit the pages of one (layer, expert, projection) cache slice so a read can land in it.
     bool commit_proj_pages(int il, int e, int p);
@@ -280,7 +297,9 @@ private:
     void evict_entry(int32_t id);
     // Evict to budget under the configured policy. `spare_current` keeps every entry the layer in
     // flight staged (cstamp_ == cgen_): its reads may still be landing, and its matmul needs it.
-    void evict_to_budget(bool spare_current);
+    // `slack_bytes` allows transient VRAM-bound staging entries (released at the next synchronized
+    // miss callback) without prematurely evicting resident L2 entries.
+    void evict_to_budget(bool spare_current, size_t slack_bytes = 0);
 
     // Decayed-frequency eviction (MoeStreamConfig::cache_freq_half_life > 0). A use at pass t adds
     // growth^t to the entry's score instead of decaying every score each pass: the order is the
@@ -364,6 +383,23 @@ private:
     bool effective_direct_ = false;
 
     std::vector<LayerExperts> layers_;
+
+    void release_vram_resident(int32_t id);
+    void flush_pending_vram_evict();
+    bool is_device_cpu_miss(int il, int e) const;
+
+    // Exclusive VRAM/RAM cache state (active only when llama_moe_cache is armed).
+    bool device_exclusive_ = false;
+    size_t device_cache_bytes_ = 0;
+    int batch_tokens_ = 1;
+    bool saw_cpu_misses_ = false;
+    long long vram_handoffs_ = 0;
+    struct DeviceCpuMapRef {
+        const int32_t * data = nullptr;
+        int n_expert = 0;
+    };
+    std::vector<DeviceCpuMapRef> device_cpu_maps_;
+    std::vector<int32_t> pending_vram_evict_;
 
     // shared-slot mode (cache off): one full-size THP-advised slot per projection, reused by layers
     void * slot_[ExpertLayout::max_slots] = {nullptr, nullptr, nullptr};

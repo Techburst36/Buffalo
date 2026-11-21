@@ -134,16 +134,28 @@ public:
     // Device-side expert cache metadata (llama_moe_cache): when active for a layer and batch,
     // llama.cpp invokes moe_cache_miss_cb for only the VRAM misses, so on_topk skips loading
     // (and skips isolating ffn_moe_topk-<il> when no observer or host policy needs it).
+    // `on_cpu_map` (optional) is invoked during ask==true when the graph exposes llama_moe_cache's
+    // host-side cpu_map tensor ("moe_cache.cpu_map-<il>") so the host cache can distinguish CPU-only
+    // misses from experts promoted into VRAM without adding any graph barrier.
     using DeviceCacheBatchFn = bool (*)(const void * ctx, int32_t il, int64_t n_tokens, int64_t n_expert_used);
-    void set_device_cache(const void * ctx, DeviceCacheBatchFn handles_batch, std::vector<uint8_t> layer_cached) {
+    using DeviceCpuMapFn = void (*)(void * ud, int32_t il, const int32_t * data, int32_t n_expert);
+    void set_device_cache(const void * ctx,
+                          DeviceCacheBatchFn handles_batch,
+                          std::vector<uint8_t> layer_cached,
+                          DeviceCpuMapFn on_cpu_map = nullptr,
+                          void * on_cpu_map_ud = nullptr) {
         dc_ctx_ = ctx;
         dc_handles_batch_ = handles_batch;
         dc_layer_cached_ = std::move(layer_cached);
+        dc_on_cpu_map_ = on_cpu_map;
+        dc_on_cpu_map_ud_ = on_cpu_map_ud;
     }
     void clear_device_cache() {
         dc_ctx_ = nullptr;
         dc_handles_batch_ = nullptr;
         dc_layer_cached_.clear();
+        dc_on_cpu_map_ = nullptr;
+        dc_on_cpu_map_ud_ = nullptr;
     }
 
     // Install the row-gathered residency policy (see bmoe/row_source.h). Non-null makes the stream
@@ -396,6 +408,8 @@ private:
     const void * dc_ctx_ = nullptr;
     DeviceCacheBatchFn dc_handles_batch_ = nullptr;
     std::vector<uint8_t> dc_layer_cached_;
+    DeviceCpuMapFn dc_on_cpu_map_ = nullptr;
+    void * dc_on_cpu_map_ud_ = nullptr;
     bool device_cache_layer_cached(int il) const {
         return il >= 0 && il < (int) dc_layer_cached_.size() && dc_layer_cached_[(size_t) il] != 0;
     }

@@ -875,6 +875,7 @@ PplResult Session::perplexity(const PplRequest & req) {
         const int prefix = std::max(1, std::min(req.skip, n - 1));
         batch_fill(b, tokens.data(), prefix, /*pos0*/ 0, /*all_logits*/ false);
         im.hook->set_batch_phase(0);
+        im.source.set_batch_tokens(prefix);
         const int prc = llama_decode(ctx, b);
         if (im.hook) im.hook->end_dense_batch();
         if (prc != 0) {
@@ -886,6 +887,7 @@ PplResult Session::perplexity(const PplRequest & req) {
         for (int pos = prefix; pos < last; ++pos) {
             batch_fill(b, tokens.data() + pos, 1, pos, /*all_logits*/ true);
             im.hook->set_batch_phase(1);
+            im.source.set_batch_tokens(1);
             const int drc = llama_decode(ctx, b);
             if (im.hook) im.hook->end_dense_batch();
             if (drc != 0) {
@@ -909,6 +911,7 @@ PplResult Session::perplexity(const PplRequest & req) {
             im.place_prefill(im.prefill && chunk >= im.cfg.prefill.min_tokens);
             batch_fill(b, tokens.data() + i, chunk, /*pos0*/ i, /*all_logits*/ true);
             im.hook->set_batch_phase(req.as_decode ? 1 : 0);
+            im.source.set_batch_tokens(chunk);
             if (im.decode_placed(ctx, b) != 0) {
                 r.error = "decode failed at position " + std::to_string(i);
                 return r;
@@ -1714,7 +1717,12 @@ bool Session::Impl::build_hook(Opening & o) {
 // Trampolines bridging llama.cpp's MoE device-cache C callbacks to the streamer and router hook.
 static void on_moe_cache_miss(int32_t il, const int32_t * experts, int32_t n_experts, void * user_data) {
     if (n_experts <= 0 || !experts || !user_data) return;
-    static_cast<ExpertStreamSource *>(user_data)->load_layer(il, experts, n_experts);
+    static_cast<ExpertStreamSource *>(user_data)->load_layer_device_miss(il, experts, n_experts);
+}
+
+static void on_device_cpu_map(void * user_data, int32_t il, const int32_t * data, int32_t n_expert) {
+    if (!user_data || !data) return;
+    static_cast<ExpertStreamSource *>(user_data)->register_device_cpu_map(il, data, n_expert);
 }
 
 static bool device_cache_handles_batch(const void * ctx, int32_t il, int64_t n_tokens, int64_t n_expert_used) {
@@ -1845,8 +1853,10 @@ bool Session::Impl::create_contexts(Opening & o) {
             std::vector<uint8_t> cached((size_t) n_layer, (uint8_t) 0);
             for (int il = 0; il < n_layer; ++il)
                 cached[(size_t) il] = llama_moe_cache_layer_cached(c, il) ? 1 : 0;
-            hook->set_device_cache(c, &device_cache_handles_batch, std::move(cached));
+            source.set_device_cache_exclusive(true, (size_t) this->cfg.moe.device_cache_mb << 20);
+            hook->set_device_cache(c, &device_cache_handles_batch, std::move(cached), &on_device_cpu_map, &source);
         } else {
+            source.set_device_cache_exclusive(false, 0);
             hook->clear_device_cache();
         }
     }
@@ -2277,6 +2287,7 @@ bool Session::Impl::arm_device_cache(Opening & o) {
     mtp.reset();
     ctx_dft.reset();
     if (hook) hook->clear_device_cache();
+    source.set_device_cache_exclusive(false, 0);
     ctx.reset();
     device_cache_armed = true;
     if (!create_contexts(o)) return false;
@@ -3742,6 +3753,7 @@ struct Session::Impl::Turn {
         // Not a trace concern, but the same per-decode frame: the drop policy is decode-only
         // unless armed for prefill, so it has to be told which phase this batch is.
         im.hook->set_batch_phase(phase);
+        im.source.set_batch_tokens(n_tokens);
         if (im.route_trace) im.hook->begin_trace_batch(base_pos, n_tokens, phase, im.turn);
         im.hook->begin_record_batch(phase, n_tokens);
         // A node is computed once for the whole batch, not per token, so a prefill chunk's graph is

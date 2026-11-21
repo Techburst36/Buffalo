@@ -1162,6 +1162,7 @@ void ExpertStreamSource::maybe_sample_dense() {
 // (brake_cache_budget, lend_cache) without replacing it.
 void ExpertStreamSource::set_cache_budget(size_t bytes) {
     if (cache_max_ == 0) return; // initialised off (shared-slot mode); the LRU buffers do not exist
+    flush_pending_vram_evict();
     const size_t ceiling = slab_mode_ ? std::min(total_expert_bytes_, slab_max_budget_) : total_expert_bytes_;
     if (bytes > cache_max_) {
         // Growing evicts nothing, so it needs no quiesce — and must not do one: cancelling the
@@ -1186,6 +1187,7 @@ void ExpertStreamSource::set_cache_budget(size_t bytes) {
 
 // The live budget to `bytes`, the ceiling untouched: what brake_cache_budget and a loan move.
 void ExpertStreamSource::move_budget(size_t bytes) {
+    flush_pending_vram_evict();
     const size_t ceiling = slab_mode_ ? std::min(total_expert_bytes_, slab_max_budget_) : total_expert_bytes_;
     bytes = std::max<size_t>(1, std::min(bytes, ceiling));
     if (bytes == cache_max_) return;
@@ -1226,6 +1228,7 @@ void ExpertStreamSource::return_cache() {
 }
 
 double ExpertStreamSource::cache_lost_frac(int n) {
+    flush_pending_vram_evict();
     if (cache_max_ == 0 || chead_ == -1 || n <= 0) return -1.0;
     // Spread over the whole list, hot to cold: what a system takes first is the cold end, and a
     // sample of only the hot end would answer "nothing yet" until the damage reached the head.
@@ -1407,18 +1410,19 @@ void ExpertStreamSource::freq_pass_check(int il) {
     freq_last_il_ = il;
 }
 
-void ExpertStreamSource::evict_to_budget(bool spare_current) {
-    if (cresident_ <= cache_max_) return;
+void ExpertStreamSource::evict_to_budget(bool spare_current, size_t slack_bytes) {
+    const size_t limit = cache_max_ + slack_bytes;
+    if (cresident_ <= limit) return;
     if (freq_half_life_ <= 0) {
         // LRU: the staged entries sit at the hot end, so the first spared tail ends the sweep.
         if (!(spare_current && cold_batch_)) {
-            while (cresident_ > cache_max_ && ctail_ != -1 && !(spare_current && cstamp_[ctail_] == cgen_))
+            while (cresident_ > limit && ctail_ != -1 && !(spare_current && cstamp_[ctail_] == cgen_))
                 evict_tail();
             return;
         }
         // A cold batch put its own misses at the tail: step over them (its matmul needs them) to
         // the older entries behind, and stop at the batch's hot block like the plain sweep does.
-        for (int32_t id = ctail_; id != -1 && cresident_ > cache_max_;) {
+        for (int32_t id = ctail_; id != -1 && cresident_ > limit;) {
             const int32_t prev = cprev_[id];
             if (cstamp_[id] != cgen_)
                 evict_entry(id);
@@ -1440,14 +1444,64 @@ void ExpertStreamSource::evict_to_budget(bool spare_current) {
     const auto colder = [](const EvictCand & a, const EvictCand & b) {
         return a.score < b.score || (a.score == b.score && a.rank < b.rank);
     };
-    const size_t over = cresident_ - cache_max_;
+    const size_t over = cresident_ - limit;
     const size_t need = std::min(cand.size(), over / std::max<size_t>(1, min_entry_bytes_) + 1);
     std::partial_sort(cand.begin(), cand.begin() + (ptrdiff_t) need, cand.end(), colder);
-    for (size_t i = 0; i < cand.size() && cresident_ > cache_max_; ++i) {
+    for (size_t i = 0; i < cand.size() && cresident_ > limit; ++i) {
         if (i == need) // the estimate fell short (entries of unequal size): order the rest too
             std::sort(cand.begin() + (ptrdiff_t) i, cand.end(), colder);
         evict_entry(cand[i].id);
     }
+}
+
+void ExpertStreamSource::set_device_cache_exclusive(bool on, size_t device_cache_bytes) {
+    flush_pending_vram_evict();
+    device_exclusive_ = on;
+    device_cache_bytes_ = on ? device_cache_bytes : 0;
+    saw_cpu_misses_ = false;
+    vram_handoffs_ = 0;
+    device_cpu_maps_.assign(n_layer_ > 0 ? (size_t) n_layer_ : 0, DeviceCpuMapRef{});
+    pending_vram_evict_.clear();
+}
+
+void ExpertStreamSource::register_device_cpu_map(int il, const int32_t * data, int n_expert) {
+    if (!device_exclusive_ || !data || il < 0 || il >= (int) device_cpu_maps_.size()) return;
+    device_cpu_maps_[(size_t) il] = DeviceCpuMapRef{data, n_expert};
+}
+
+bool ExpertStreamSource::is_device_cpu_miss(int il, int e) const {
+    if (!device_exclusive_ || il < 0 || il >= (int) device_cpu_maps_.size()) return false;
+    const DeviceCpuMapRef & m = device_cpu_maps_[(size_t) il];
+    return m.data != nullptr && e >= 0 && e < m.n_expert && m.data[e] == e;
+}
+
+void ExpertStreamSource::release_vram_resident(int32_t id) {
+    if ((size_t) id >= cvalid_.size() || !cvalid_[id]) return;
+    if (slab_mode_) {
+        const int32_t loc = cloc_[id];
+        if (loc == -1) {
+            const int e = id % n_expert_;
+            if (exec_owner_[(size_t) e] == id) exec_owner_[(size_t) e] = -1;
+        } else if (loc >= 0) {
+            if (slab_owner_[(size_t) loc] == id) slab_owner_[(size_t) loc] = -1;
+            slab_free_.push(loc);
+        }
+        cloc_[id] = -2;
+    } else {
+        release_entry_pages(id);
+    }
+    cvalid_[id] = 0;
+    cspec_[id] = 0;
+    cresident_ -= entry_bytes(id / n_expert_);
+    lru_unlink(id);
+    ++vram_handoffs_;
+}
+
+void ExpertStreamSource::flush_pending_vram_evict() {
+    if (pending_vram_evict_.empty()) return;
+    for (int32_t id : pending_vram_evict_)
+        release_vram_resident(id);
+    pending_vram_evict_.clear();
 }
 
 void ExpertStreamSource::evict_entry(int32_t id) {
@@ -1793,7 +1847,7 @@ void ExpertStreamSource::admit_entry(int32_t id) {
     disc_.used(id, cgen_);
 }
 
-bool ExpertStreamSource::touch_entry(int il, int e, bool & hit, bool promote, int commit_only_proj) {
+bool ExpertStreamSource::touch_entry(int il, int e, bool & hit, bool promote, int commit_only_proj, bool touch_freq) {
     const int32_t id = il * n_expert_ + e;
     clookups_++;
     cstamp_[id] = cgen_;
@@ -1801,7 +1855,7 @@ bool ExpertStreamSource::touch_entry(int il, int e, bool & hit, bool promote, in
     // accounting, but its bytes are gone: a miss the caller reads whole again, so it is scored and
     // placed like one (a cold batch admits it at the cold end, as any other miss of that batch).
     const bool lost = cvalid_[id] && !disc_.take_back(id);
-    if ((cvalid_[id] && !lost) || !cold_batch_) freq_touch(id);
+    if (touch_freq && ((cvalid_[id] && !lost) || !cold_batch_)) freq_touch(id);
     if (lost) {
         shrink_for_drop(entry_bytes(il));
         cspec_[id] = 0;
@@ -1852,13 +1906,31 @@ bool ExpertStreamSource::touch_entry(int il, int e, bool & hit, bool promote, in
 
 // ── load: stage routed experts, read the batch, evict cold entries to budget ────────
 bool ExpertStreamSource::load_layer(int il, const int32_t * ids, int n_ids) {
+    return load_layer_impl(il, ids, n_ids, /*device_miss=*/false);
+}
+
+bool ExpertStreamSource::load_layer_device_miss(int il, const int32_t * ids, int n_ids) {
+    return load_layer_impl(il, ids, n_ids, device_exclusive_);
+}
+
+bool ExpertStreamSource::load_layer_impl(int il, const int32_t * ids, int n_ids, bool device_miss) {
     if (!active_ || il < 0 || il >= n_layer_ || !layers_[il].bound || !ids || n_ids <= 0) return false;
     freq_pass_check(il);
     if (overlap_) return load_layer_async(il, ids, n_ids);
     LayerExperts & L = layers_[il];
     cgen_++;
+    // Release any host-RAM copies handed off to VRAM on the previous layer. Safe here because
+    // llama_moe_cache::copy() / sched_copy_experts() synchronized the device before invoking us,
+    // and RouterHook::on_topk() synchronized before calling load_layer().
+    flush_pending_vram_evict();
+    // llama_moe_cache::copy() handles batches up to 32 tokens and inserts fills into VRAM; wider
+    // batches run sched_copy_experts() (prepare_wide_misses) without inserting into VRAM.
+    const bool wide_prefill = device_miss && batch_tokens_ > 32;
+    const bool prefill_into_vram =
+        device_miss && !wide_prefill && (batch_tokens_ >= 4 || (top_k_ > 0 && n_ids >= top_k_ * 2));
     // A wide graph is a prefill; a decode or a speculative verify window is far narrower.
-    cold_batch_ = prefill_cold_ && cache_max_ && top_k_ > 0 && n_ids >= top_k_ * cold_min_tokens_;
+    cold_batch_ = prefill_into_vram ||
+                  (prefill_cold_ && cache_max_ && top_k_ > 0 && n_ids >= top_k_ * cold_min_tokens_);
     jobs_.clear();
 
     // Cache-management work (vm commit + LRU bookkeeping, then eviction below) is timed into
@@ -1888,10 +1960,18 @@ bool ExpertStreamSource::load_layer(int il, const int32_t * ids, int n_ids) {
             }
             return true;
         }
+        const int32_t id = il * n_expert_ + e;
+        const bool is_cpu = device_miss && is_device_cpu_miss(il, e);
+        if (is_cpu) saw_cpu_misses_ = true;
+        const bool enters_vram = device_miss && !wide_prefill && !is_cpu;
+        const bool was_valid = cvalid_[id] != 0;
+        // Exclusive VRAM/RAM handoff: an expert promoted from host RAM into VRAM (or any VRAM fill
+        // once cpu_share is actively feeding host RAM) must not stay pinned hot in host RAM.
+        const bool suppress_warm = enters_vram && (was_valid || saw_cpu_misses_);
         bool hit = false;
-        if (!touch_entry(il, e, hit)) return false;
+        if (!touch_entry(il, e, hit, /*promote=*/!suppress_warm, -1, /*touch_freq=*/!suppress_warm)) return false;
+        if (enters_vram && (hit || saw_cpu_misses_)) pending_vram_evict_.push_back(id);
         if (slab_mode_) {
-            const int32_t id = il * n_expert_ + e;
             if (hit) {
                 if (cloc_[id] >= 0) slab_hits_.push_back(e);
             } else {
@@ -1925,7 +2005,7 @@ bool ExpertStreamSource::load_layer(int il, const int32_t * ids, int n_ids) {
             // distinct, so in decode (n=1) this used to be unreachable — but cache-aware dropping
             // repoints a dropped slot's id at the routing's top expert, which makes duplicates the
             // normal case there. Promoting the same entry twice is idempotent, so it stays correct.
-            if (cache_max_) {
+            if (cache_max_ && !device_miss) {
                 const int32_t id = il * n_expert_ + e;
                 if (cold_gen_[id] != cgen_) {
                     lru_unlink(id);
@@ -1949,11 +2029,16 @@ bool ExpertStreamSource::load_layer(int il, const int32_t * ids, int n_ids) {
     account_demand(il, n_unique);
     maybe_sample_dense();
 
+    // Transient VRAM-bound fills queued in pending_vram_evict_ are released at the start of the
+    // very next synchronized miss callback; do not let them evict live non-VRAM L2 entries.
+    const size_t transient_slack =
+        device_miss && !pending_vram_evict_.empty() ? pending_vram_evict_.size() * entry_bytes(il) : 0;
+
     if (slab_mode_) {
         // Phase 2: evict cold entries to budget BEFORE vacating exec_slot_ so any old_id sitting
         // in exec_slot_[e] that is already cold enough to evict is dropped in place with zero copy.
         regrow_for_load();
-        evict_to_budget(/*spare_current=*/true);
+        evict_to_budget(/*spare_current=*/true, transient_slack);
 
         // Phase 3: vacate surviving old_ids from exec_slot_[e] into slab_pool_ for misses, then
         // bind the new miss entries into exec_slot_[e] and emit direct reads into exec_slot_.
@@ -2079,7 +2164,7 @@ bool ExpertStreamSource::load_layer(int il, const int32_t * ids, int n_ids) {
     if (cache_max_ && !slab_mode_) {
         const auto te0 = clock_t_::now();
         regrow_for_load();
-        evict_to_budget(/*spare_current=*/true);
+        evict_to_budget(/*spare_current=*/true, transient_slack);
         mgmt_ns_.fetch_add(
             (long long) std::chrono::duration_cast<std::chrono::nanoseconds>(clock_t_::now() - te0).count());
     }
@@ -2608,6 +2693,12 @@ void ExpertStreamSource::shutdown() {
     cloc_.clear();
     spec_slot_.clear();
     slab_free_ = decltype(slab_free_){};
+    device_exclusive_ = false;
+    device_cache_bytes_ = 0;
+    batch_tokens_ = 1;
+    saw_cpu_misses_ = false;
+    device_cpu_maps_.clear();
+    pending_vram_evict_.clear();
     for (int p = 0; p < ExpertLayout::max_slots; ++p) {
         for (int il = 0; il < (int) lbuf_[p].size(); ++il)
             if (lbuf_[p][il]) pio::vm_release(lbuf_[p][il], lbuf_sz_[p][il]);

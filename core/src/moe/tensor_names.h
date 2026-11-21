@@ -68,6 +68,9 @@ inline bool is_token_table(const std::string & name) {
 inline constexpr std::string_view k_topk_node = "ffn_moe_topk-";
 inline constexpr std::string_view k_logits_node = "ffn_moe_logits-";
 inline constexpr std::string_view k_layer_out_node = "l_out-";
+// Host CPU-share lookup table created by llama_moe_cache when moe_cache_cpu_share > 0:
+// "moe_cache.cpu_map-<il>". Entry [e] == e iff expert e is computed on CPU rather than uploaded.
+inline constexpr std::string_view k_moe_cache_cpu_map = "moe_cache.cpu_map-";
 
 // Every routing node - the topk, the weight chain, the gate matmul - starts with this. A graph has
 // thousands of nodes and the router hook's ask pass sees all of them, so this one comparison is

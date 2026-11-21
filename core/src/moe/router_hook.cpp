@@ -1547,6 +1547,16 @@ bool RouterHook::on_eval(ggml_tensor * t, bool ask) {
 
     if (row_source_ && ask) serve_rows(t);
 
+    // Observe llama_moe_cache's host cpu_map tensors ("moe_cache.cpu_map-<il>") during the ask pass
+    // with zero barriers so exclusive VRAM/RAM caching can separate CPU-only misses from VRAM fills.
+    if (ask && dc_on_cpu_map_ && t->op == GGML_OP_GET_ROWS) {
+        const ggml_tensor * tbl = t->src[0];
+        if (tbl && tbl->type == GGML_TYPE_I32 && host_readable(tbl) && tbl->name[0] == 'm') {
+            const int cl = tn::node_layer(tbl->name, tn::k_moe_cache_cpu_map);
+            if (cl >= 0) dc_on_cpu_map_(dc_on_cpu_map_ud_, cl, static_cast<const int32_t *>(tbl->data), (int32_t) tbl->ne[1]);
+        }
+    }
+
     // ── layer-wise dense weight streaming (--dense-stream) ──
     // On ask == true: before ggml executes node `t`, pin every streamed dense group referenced
     // by `t` or its inputs (walking view_src chains to weight leaves), refresh any view->data
