@@ -200,7 +200,6 @@ bool IoUringBlockProvider::open(const std::vector<std::string> & paths,
     align_ = pio::direct_align_fallback;
     align_reported_ = true;
     buffer_align_ = page;
-    bool any_aligned = false;
 
     shards_.reserve(paths.size());
     for (const std::string & p : paths) {
@@ -263,29 +262,18 @@ bool IoUringBlockProvider::open(const std::vector<std::string> & paths,
         align_ = std::max(align_, s.align);
         align_reported_ = align_reported_ && s.align_reported;
         buffer_align_ = std::max(buffer_align_, std::max(s.align, page));
-        any_aligned = any_aligned || s.aligned_reads;
         shards_.push_back(std::move(s));
     }
 
+    // Bounce slots are allocated lazily on first use in ensure_bounce() so physical memory stays
+    // bounded to peak concurrent in-flight requests rather than the full SQ ring depth.
     bounces_.resize(qd_);
-    if (any_aligned && max_read > 0) {
-        const size_t init_cap = max_read + 2 * align_;
-        for (uint32_t i = 0; i < qd_; ++i) {
-            bounces_[i].buf = pio::alloc_aligned(align_, init_cap);
-            if (!bounces_[i].buf) {
-                log_printf(LogLevel::Error, "io_uring: bounce alloc %zu failed (slot %u)", init_cap, i);
-                close();
-                return false;
-            }
-            bounces_[i].cap = init_cap;
-        }
-    }
     return true;
 }
 
 void IoUringBlockProvider::close() {
     for (auto & b : bounces_) {
-        if (b.buf) pio::aligned_free(b.buf);
+        if (b.buf && b.cap) pio::vm_release(b.buf, b.cap);
         b.buf = nullptr;
         b.cap = 0;
     }
@@ -322,15 +310,19 @@ uint64_t IoUringBlockProvider::shard_size(int shard) const {
 bool IoUringBlockProvider::ensure_bounce(uint32_t slot, size_t need) {
     BounceSlot & b = bounces_[slot];
     if (b.cap >= need) return true;
-    if (b.buf) pio::aligned_free(b.buf);
+    if (b.buf && b.cap) pio::vm_release(b.buf, b.cap);
     b.buf = nullptr;
     b.cap = 0;
-    b.buf = pio::alloc_aligned(align_, need);
+    // Grow directly to at least max_read_ + 2 * align_ when known so a slot never reallocates
+    // across projections of a layer.
+    const size_t target = max_read_ > 0 ? std::max(need, max_read_ + 2 * align_) : need;
+    size_t alloc_sz = 0;
+    b.buf = pio::alloc_thp_buffer(target, align_, target, &alloc_sz);
     if (!b.buf) {
-        log_printf(LogLevel::Error, "io_uring: bounce realloc %zu failed", need);
+        log_printf(LogLevel::Error, "io_uring: bounce alloc %zu failed (slot %u)", target, slot);
         return false;
     }
-    b.cap = need;
+    b.cap = alloc_sz;
     return true;
 }
 
@@ -347,8 +339,12 @@ long long IoUringBlockProvider::read(int /*lane*/, int shard, void * dst, uint64
 
 bool IoUringBlockProvider::read_batch(BlockReadReq * reqs,
                                       size_t count,
-                                      const std::function<void(size_t idx, bool ok)> & on_complete) {
-    if (count == 0) return true;
+                                      const std::function<void(size_t idx, bool ok)> & on_complete,
+                                      const std::function<void()> & on_submitted) {
+    if (count == 0) {
+        if (on_submitted) on_submitted();
+        return true;
+    }
     if (!reqs || !is_open()) return false;
 
     std::lock_guard<std::mutex> lk(ring_mtx_);
@@ -365,6 +361,7 @@ bool IoUringBlockProvider::read_batch(BlockReadReq * reqs,
     resubmit.reserve(qd_);
 
     bool all_ok = true;
+    bool submitted_fired = false;
     size_t next_req = 0;
     uint32_t in_flight = 0;
     uint32_t sq_tail = *sq_tail_;
@@ -498,7 +495,39 @@ bool IoUringBlockProvider::read_batch(BlockReadReq * reqs,
             store_release(sq_tail_, sq_tail);
         }
 
-        // Submit all queued SQEs and wait for at least 1 completion in one syscall.
+        // If the caller supplied an on_submitted hook, kick off the NVMe SQEs immediately with
+        // min_complete=0, run the caller's overlapped CPU work while storage reads execute, and
+        // then enter again to reap completions.
+        if (on_submitted && !submitted_fired) {
+            submitted_fired = true;
+            if (to_submit > 0) {
+                int sret = 0;
+                do {
+                    sret = sys_io_uring_enter(ring_fd_, to_submit, 0, 0);
+                    if (sret >= 0) {
+                        to_submit = (uint32_t) sret < to_submit ? to_submit - (uint32_t) sret : 0;
+                    }
+                } while (sret < 0 && errno == EINTR);
+                if (sret < 0) {
+                    log_printf(LogLevel::Error, "io_uring_enter(submit) failed: %s (errno=%d)", std::strerror(errno),
+                               errno);
+                    on_submitted();
+                    all_ok = false;
+                    for (uint32_t i = 0; i < qd_; ++i) {
+                        if (std::find(free_slots.begin(), free_slots.end(), i) == free_slots.end()) {
+                            fail_req(slots[i].req_idx);
+                            free_slots.push_back(i);
+                        }
+                    }
+                    while (next_req < count) fail_req(next_req++);
+                    in_flight = 0;
+                    break;
+                }
+            }
+            on_submitted();
+        }
+
+        // Submit any remaining queued SQEs and wait for at least 1 completion in one syscall.
         int ret = 0;
         do {
             ret = sys_io_uring_enter(ring_fd_, to_submit, 1, IORING_ENTER_GETEVENTS);
@@ -586,6 +615,8 @@ bool IoUringBlockProvider::read_batch(BlockReadReq * reqs,
         }
         store_release(cq_head_, cq_head);
     }
+
+    if (on_submitted && !submitted_fired) on_submitted();
 
     io_ns_.fetch_add((long long) std::chrono::duration_cast<std::chrono::nanoseconds>(clock_t_::now() - batch_t0).count(),
                      std::memory_order_relaxed);

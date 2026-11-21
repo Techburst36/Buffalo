@@ -22,7 +22,9 @@ using clock_t_ = std::chrono::steady_clock;
 
 bool BlockProvider::read_batch(BlockReadReq * reqs,
                                size_t count,
-                               const std::function<void(size_t idx, bool ok)> & on_complete) {
+                               const std::function<void(size_t idx, bool ok)> & on_complete,
+                               const std::function<void()> & on_submitted) {
+    if (on_submitted) on_submitted();
     if (count == 0) return true;
     if (!reqs) return false;
     bool all_ok = true;

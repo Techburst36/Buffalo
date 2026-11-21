@@ -27,8 +27,10 @@
 #include <atomic>
 #include <condition_variable>
 #include <cstdint>
+#include <functional>
 #include <memory>
 #include <mutex>
+#include <queue>
 #include <string>
 #include <thread>
 #include <unordered_map>
@@ -363,10 +365,71 @@ private:
 
     std::vector<LayerExperts> layers_;
 
-    // shared-slot mode (cache off): one full-size slot per projection, reused by layers
+    // shared-slot mode (cache off): one full-size THP-advised slot per projection, reused by layers
     void * slot_[ExpertLayout::max_slots] = {nullptr, nullptr, nullptr};
+    size_t slot_sz_[ExpertLayout::max_slots] = {0, 0, 0};
 
-    // LRU mode (cache on): per-(layer, projection) reserved buffers
+    // Zero-fault pre-faulted THP slab + exclusive exec_slot mode (cache on, uniform expert layout,
+    // budget >= one full layer). Every bound layer's expert tensor->data points at exec_slot_[p]
+    // (n_expert slices, 2 MiB THP). Resident entries live either directly in exec_slot_[e]
+    // (cloc_[id] == -1) or disjointly in slab_pool_[s] (cloc_[id] == s >= 0). Total physical memory
+    // (exec_slot_ + slab_pool_) is strictly <= cache_max_ so tight-RAM hosts stay at 0 swap while
+    // eliminating MADV_DONTNEED syscalls and steady-state minor page faults.
+    struct SlabCopyOp {
+        int32_t e = -1;
+        int32_t s = -1;
+        int8_t p = -1;
+        uint8_t kind = 0; // 0 = exec->slab vacate, 1 = slab->exec one-way hit, 2 = exec<->slab swap
+        size_t off = 0;
+        size_t len = 0;
+    };
+    bool slab_mode_ = false;
+    void * exec_slot_[ExpertLayout::max_slots] = {nullptr, nullptr, nullptr};
+    size_t exec_slot_sz_[ExpertLayout::max_slots] = {0, 0, 0};
+    void * slab_pool_ = nullptr;
+    size_t slab_pool_sz_ = 0;
+    size_t slab_stride_ = 0;
+    size_t slab_proj_off_[ExpertLayout::max_slots] = {0, 0, 0};
+    uint64_t slab_proj_nb2_[ExpertLayout::max_slots] = {0, 0, 0};
+    size_t slab_cap_ = 0;
+    size_t slab_max_budget_ = 0;
+    std::vector<int32_t> exec_owner_; // [n_expert]: valid entry id in exec_slot_[e], or -1
+    std::vector<int32_t> slab_owner_; // [slab_cap_]: valid or spec-reserved entry id in slab_pool_[s], or -1
+    std::vector<int32_t> cloc_;       // [n_layer * n_expert]: -2 absent, -1 exec_slot_[e], >=0 slab slot
+    std::vector<int32_t> spec_slot_;  // [n_layer * n_expert]: reserved slab slot for in-flight spec, or -1
+    // Min-heap of free slab slot indices: always hands out the lowest-indexed hot slot so high
+    // virtual headroom slots remain untouched unless exec_slot_ has empty holes or prefetch runs.
+    std::priority_queue<int32_t, std::vector<int32_t>, std::greater<int32_t>> slab_free_;
+    std::vector<int> slab_hits_;
+    std::vector<int> slab_misses_;
+    std::vector<int32_t> hit_free_slots_;
+    std::vector<SlabCopyOp> vacate_ops_;
+    std::vector<SlabCopyOp> hit_ops_;
+
+    // Lightweight persistent worker pool for parallel chunked slab vacates and hit swaps.
+    std::vector<std::thread> copy_pool_;
+    std::mutex copy_mtx_;
+    std::condition_variable copy_cv_, copy_done_cv_;
+    const std::vector<SlabCopyOp> * copy_cur_ops_ = nullptr;
+    std::atomic<size_t> copy_next_{0};
+    size_t copy_total_ = 0;
+    size_t copy_done_ = 0;
+    uint64_t copy_gen_ = 0;
+    bool copy_stop_ = false;
+
+    char * exec_ptr(int e, int p) const {
+        return static_cast<char *>(exec_slot_[p]) + (uint64_t) e * slab_proj_nb2_[p];
+    }
+    char * slab_ptr(int32_t s, int p) const {
+        return static_cast<char *>(slab_pool_) + (size_t) s * slab_stride_ + slab_proj_off_[p];
+    }
+    int32_t alloc_slab_slot(bool allow_evict);
+    void push_copy_ops(std::vector<SlabCopyOp> & ops, int32_t e, int32_t s, uint8_t kind) const;
+    void exec_copy_op(const SlabCopyOp & op) const;
+    void run_copy_ops(const std::vector<SlabCopyOp> & ops);
+    void copy_worker();
+
+    // LRU mode (cache on): per-(layer, projection) reserved buffers (fallback when !slab_mode_)
     size_t cache_max_ = 0; // live budget in bytes: set_cache_budget(), and with a discardable cache follow_
     size_t page_ = pio::vm_page();
 

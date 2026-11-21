@@ -557,6 +557,27 @@ int main(int argc, char ** argv) {
             return 2;
         }
         fails += check("G1z local zero-mmap streaming == resident", s_res, zr.generated_text);
+
+        // G2z — steady-state zero-minor-fault proof for the strictly bounded pre-faulted THP
+        // slab + exec_slot allocator: run a second turn on the same evicting cache session and
+        // verify evictions happen cleanly with exact byte-identity and near-zero minor faults.
+        req.clear_kv = true;
+        const uint64_t mf0 = pio::minor_faults();
+        const RunResult zr2 = zs->generate(req);
+        const uint64_t mf_delta = pio::minor_faults() - mf0;
+        if (!zr2) {
+            std::fprintf(stderr, "G2z generate failed: %s\n", zr2.error.c_str());
+            return 2;
+        }
+        fails += check("G2z THP slab steady-state turn2 == resident", s_res, zr2.generated_text);
+        if (mf_delta >= 512) {
+            std::printf("[FAIL] G2z THP slab steady-state incurred %llu minor faults (expected < 512, evictions=%lld)\n",
+                        (unsigned long long) mf_delta, zr2.summary.cache_evictions);
+            ++fails;
+        } else {
+            std::printf("[PASS] G2z THP slab steady-state: %llu minor faults (evictions=%lld)\n",
+                        (unsigned long long) mf_delta, zr2.summary.cache_evictions);
+        }
     }
 #endif
     fails += check("G2 streaming(cache off) == streaming(LRU cache)", s_s0, s_sc);

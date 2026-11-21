@@ -1583,6 +1583,29 @@ void pinned_free(PinnedAlloc *) {}
 
 #endif
 
+void * alloc_thp_buffer(size_t bytes, size_t min_align, size_t prefault_bytes, size_t * out_sz) {
+    if (out_sz) *out_sz = 0;
+    if (bytes == 0) return nullptr;
+    constexpr size_t k_thp = 2ull << 20;
+    const size_t page = vm_page();
+    const size_t base_align = (std::max)(min_align, page);
+    const size_t align = bytes >= k_thp ? (std::max)(base_align, k_thp) : base_align;
+    const size_t sz = ((bytes + page - 1) / page) * page;
+    void * p = vm_reserve_aligned(sz, align);
+    if (!p) return nullptr;
+    if (sz >= k_thp) vm_advise_hugepage(p, sz);
+    if (!vm_commit(p, sz)) {
+        vm_release(p, sz);
+        return nullptr;
+    }
+    const size_t touch_n = (std::min)(sz, prefault_bytes);
+    auto * touch = static_cast<volatile uint8_t *>(p);
+    for (size_t off = 0; off < touch_n; off += page)
+        touch[off] = 0;
+    if (out_sz) *out_sz = sz;
+    return p;
+}
+
 bool read_through_cache(const char * path,
                         const std::vector<std::pair<uint64_t, uint64_t>> & ranges,
                         const std::atomic<bool> * stop) {

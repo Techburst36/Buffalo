@@ -58,7 +58,8 @@ public:
 
     bool read_batch(BlockReadReq * reqs,
                     size_t count,
-                    const std::function<void(size_t idx, bool ok)> & on_complete = nullptr) override;
+                    const std::function<void(size_t idx, bool ok)> & on_complete = nullptr,
+                    const std::function<void()> & on_submitted = nullptr) override;
 
     // Total HTTP payload bytes transferred over the wire (excludes local disk spill cache hits).
     long long read_bytes() const override { return (long long) read_bytes_.load(std::memory_order_relaxed); }

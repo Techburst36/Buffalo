@@ -51,7 +51,8 @@ public:
     long long read(int lane, int shard, void * dst, uint64_t off, uint64_t nbytes) override;
     bool read_batch(BlockReadReq * reqs,
                     size_t count,
-                    const std::function<void(size_t idx, bool ok)> & on_complete = nullptr) override;
+                    const std::function<void(size_t idx, bool ok)> & on_complete = nullptr,
+                    const std::function<void()> & on_submitted = nullptr) override;
 
     long long read_bytes() const override { return read_bytes_.load(std::memory_order_relaxed); }
     long long io_ns() const override { return io_ns_.load(std::memory_order_relaxed); }

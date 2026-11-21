@@ -206,6 +206,10 @@ void * vm_reserve_aligned(size_t sz, size_t align);
 // Advice only; a no-op where unsupported.
 void vm_advise_hugepage(void * p, size_t sz);
 bool vm_commit(void * p, size_t sz);
+// Reserve, hint THP (best-effort when >= 2 MiB), commit, and pre-touch up to `prefault_bytes` of
+// an anonymous buffer aligned to at least `min_align` (and 2 MiB when size >= 2 MiB). Sets
+// `*out_sz` to the page-rounded mapping size to pass to vm_release(). Returns nullptr on failure.
+void * alloc_thp_buffer(size_t bytes, size_t min_align, size_t prefault_bytes, size_t * out_sz);
 // Ask the kernel to keep a committed span in RAM: not swapped, not compressed. False where the
 // platform refuses (a locked-memory limit, or no such call), and the span is then ordinary memory.
 // vm_evict releases a pinned span like any other. Whether this is available is the whole

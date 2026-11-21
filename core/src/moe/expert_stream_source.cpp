@@ -185,13 +185,30 @@ bool ExpertStreamSource::init(const std::vector<std::string> & shard_paths,
         }
     }
 
+    slab_mode_ = false;
+    slab_pool_ = nullptr;
+    slab_pool_sz_ = 0;
+    slab_stride_ = 0;
+    slab_cap_ = 0;
+    slab_max_budget_ = 0;
+    for (int p = 0; p < ExpertLayout::max_slots; ++p) {
+        slot_[p] = nullptr;
+        slot_sz_[p] = 0;
+        exec_slot_[p] = nullptr;
+        exec_slot_sz_[p] = 0;
+        slab_proj_off_[p] = 0;
+        slab_proj_nb2_[p] = 0;
+    }
+
     if (cache_max_ == 0) {
-        // One shared slot per present projection, reused across layers (one layer computes
-        // at a time). Rebind every bound layer's expert tensors onto them; only routed
-        // slices are ever valid. Absent slots (max_full[p] == 0) get no buffer.
+        // One shared THP-advised slot per present projection, reused across layers (one layer
+        // computes at a time). Rebind every bound layer's expert tensors onto them; only routed
+        // slices are ever valid. Lazy-committed (prefault=0) so tight-RAM hosts only back expert
+        // indices actually routed while still getting 2 MiB THP and 0 steady-state faults.
         for (int p = 0; p < ExpertLayout::max_slots; ++p) {
             if (max_full[p] == 0) continue;
-            slot_[p] = pio::alloc_aligned(buf_align_, max_full[p] + pio::tensor_tail_slack());
+            const size_t need = max_full[p] + pio::tensor_tail_slack();
+            slot_[p] = pio::alloc_thp_buffer(need, buf_align_, /*prefault_bytes=*/0, &slot_sz_[p]);
             if (!slot_[p]) {
                 log_printf(LogLevel::Error, "slot alloc %zu failed", max_full[p]);
                 return false;
@@ -203,40 +220,145 @@ bool ExpertStreamSource::init(const std::vector<std::string> & shard_paths,
                 if (L.proj[p].tensor) L.proj[p].tensor->data = slot_[p];
         }
     } else {
-        // LRU cache: one reserved (address-only) buffer per (layer, projection). Physical
-        // pages appear on the first miss and are released on eviction. mul_mat_id needs
-        // each expert at its canonical offset e*nb2 inside tensor->data, so the buffers
-        // live at fixed per-layer addresses; lazy commit keeps that affordable. (page_ is already
-        // set above: the dense-residency probe needs it in every cache mode, not just this one.)
-        for (int p = 0; p < ExpertLayout::max_slots; ++p) {
-            lbuf_[p].assign(n_layer_, nullptr);
-            lbuf_sz_[p].assign(n_layer_, 0);
-        }
-        for (int il = 0; il < n_layer_; ++il) {
-            LayerExperts & L = layers_[il];
+        // Check whether all bound layers share a uniform expert slice geometry and whether the
+        // budget covers at least one full execution slot so we can use the strictly bounded
+        // zero-fault pre-faulted 2-MiB THP exec_slot + slab_pool allocator instead of per-eviction
+        // MADV_DONTNEED and 4-KiB minor page-fault churn.
+        bool uniform_nb2 = true;
+        bool saw_bound = false;
+        size_t n_bound_layers = 0;
+        uint64_t u_nb2[ExpertLayout::max_slots] = {0, 0, 0};
+        for (const LayerExperts & L : layers_) {
             if (!L.bound) continue;
+            ++n_bound_layers;
+            if (!saw_bound) {
+                for (int p = 0; p < ExpertLayout::max_slots; ++p)
+                    u_nb2[p] = L.proj[p].nb2;
+                saw_bound = true;
+            } else {
+                for (int p = 0; p < ExpertLayout::max_slots; ++p)
+                    if (L.proj[p].nb2 != u_nb2[p]) uniform_nb2 = false;
+            }
+        }
+        size_t entry_sz = 0;
+        size_t cur_off = 0;
+        for (int p = 0; p < ExpertLayout::max_slots; ++p) {
+            entry_sz += (size_t) u_nb2[p];
+            if (u_nb2[p] == 0) continue;
+            slab_proj_off_[p] = cur_off;
+            cur_off = (cur_off + (size_t) u_nb2[p] + 63u) & ~size_t(63u);
+        }
+        slab_stride_ = ((cur_off + page_ - 1) / page_) * page_;
+        const size_t raw_exec_bytes = entry_sz * (size_t) n_expert_;
+        const size_t total_slots = entry_sz ? (cache_max_ / entry_sz) : 0;
+        const size_t max_possible = n_bound_layers * (size_t) n_expert_;
+        const size_t cap_slots = std::min(total_slots, max_possible);
+        // Enable zero-fault THP slab mode whenever the budget holds at least one full execution
+        // slot. We reserve virtual slots for cap_slots plus a tiny bounded speculative staging
+        // margin (<= 16 experts, never an entire extra layer), pre-faulting only the initial
+        // cap_slots - n_expert_ prefix so startup physical RAM stays <= cache_max_ and the
+        // min-heap keeps steady-state physical RAM tightly bounded to cache_max_.
+        const bool want_slab =
+            uniform_nb2 && entry_sz > 0 && slab_stride_ > 0 && !pin_fit_ && !discard_drop_ &&
+            total_slots > 0 && cache_max_ >= raw_exec_bytes;
+
+        if (want_slab) {
+            bool ok = true;
             for (int p = 0; p < ExpertLayout::max_slots; ++p) {
-                if (!L.proj[p].tensor) continue; // absent slot in a fused layout
-                // The last expert's slice is followed by the slack a kernel may read past it.
-                const size_t full = (size_t) L.proj[p].nb2 * (size_t) n_expert_ + pio::tensor_tail_slack();
-                lbuf_[p][il] = pio::vm_reserve(full);
-                if (!lbuf_[p][il]) {
-                    log_printf(LogLevel::Error, "vm_reserve %zu failed (layer %d)", full, il);
-                    return false;
+                slab_proj_nb2_[p] = u_nb2[p];
+                if (u_nb2[p] == 0) continue;
+                const size_t need = (size_t) u_nb2[p] * (size_t) n_expert_ + pio::tensor_tail_slack();
+                exec_slot_[p] = pio::alloc_thp_buffer(need, buf_align_, need, &exec_slot_sz_[p]);
+                if (!exec_slot_[p]) {
+                    ok = false;
+                    break;
                 }
-                lbuf_sz_[p][il] = full;
-                L.proj[p].tensor->data = lbuf_[p][il];
+            }
+            const size_t spec_margin = std::min<size_t>((size_t) n_expert_, 16);
+            slab_cap_ = std::min(max_possible, cap_slots + spec_margin);
+            slab_max_budget_ = std::min(total_expert_bytes_, cap_slots * entry_sz);
+            if (ok && slab_cap_ > 0) {
+                const size_t prefault_slots =
+                    cap_slots > (size_t) n_expert_ ? (cap_slots - (size_t) n_expert_) : 0;
+                const size_t total_va = slab_cap_ * slab_stride_;
+                slab_pool_ =
+                    pio::alloc_thp_buffer(total_va, page_, prefault_slots * slab_stride_, &slab_pool_sz_);
+                if (!slab_pool_) ok = false;
+            }
+            if (ok) {
+                slab_mode_ = true;
+                for (LayerExperts & L : layers_) {
+                    if (!L.bound) continue;
+                    for (int p = 0; p < ExpertLayout::max_slots; ++p)
+                        if (L.proj[p].tensor) L.proj[p].tensor->data = exec_slot_[p];
+                }
+                exec_owner_.assign((size_t) n_expert_, -1);
+                slab_owner_.assign(slab_cap_, -1);
+                slab_free_ = decltype(slab_free_){};
+                for (size_t s = 0; s < slab_cap_; ++s)
+                    slab_free_.push((int32_t) s);
+                slab_hits_.reserve((size_t) n_expert_);
+                slab_misses_.reserve((size_t) n_expert_);
+                hit_free_slots_.reserve((size_t) n_expert_);
+                vacate_ops_.reserve((size_t) n_expert_ * ExpertLayout::max_slots * 4);
+                hit_ops_.reserve((size_t) n_expert_ * ExpertLayout::max_slots * 4);
+            } else {
+                for (int p = 0; p < ExpertLayout::max_slots; ++p) {
+                    if (exec_slot_[p] && exec_slot_sz_[p]) pio::vm_release(exec_slot_[p], exec_slot_sz_[p]);
+                    exec_slot_[p] = nullptr;
+                    exec_slot_sz_[p] = 0;
+                }
+                if (slab_pool_ && slab_pool_sz_) pio::vm_release(slab_pool_, slab_pool_sz_);
+                slab_pool_ = nullptr;
+                slab_pool_sz_ = 0;
+                slab_cap_ = 0;
+                slab_max_budget_ = 0;
+                log_printf(LogLevel::Warn, "expert cache: THP slab alloc failed, falling back to sparse VM");
+            }
+        }
+
+        if (!slab_mode_) {
+            // LRU cache fallback: one reserved (address-only) buffer per (layer, projection).
+            // Physical pages appear on the first miss and are released on eviction.
+            for (int p = 0; p < ExpertLayout::max_slots; ++p) {
+                lbuf_[p].assign(n_layer_, nullptr);
+                lbuf_sz_[p].assign(n_layer_, 0);
+            }
+            for (int il = 0; il < n_layer_; ++il) {
+                LayerExperts & L = layers_[il];
+                if (!L.bound) continue;
+                for (int p = 0; p < ExpertLayout::max_slots; ++p) {
+                    if (!L.proj[p].tensor) continue; // absent slot in a fused layout
+                    // The last expert's slice is followed by the slack a kernel may read past it.
+                    const size_t full = (size_t) L.proj[p].nb2 * (size_t) n_expert_ + pio::tensor_tail_slack();
+                    lbuf_[p][il] = pio::vm_reserve(full);
+                    if (!lbuf_[p][il]) {
+                        log_printf(LogLevel::Error, "vm_reserve %zu failed (layer %d)", full, il);
+                        return false;
+                    }
+                    lbuf_sz_[p][il] = full;
+                    L.proj[p].tensor->data = lbuf_[p][il];
+                }
             }
         }
         const size_t n_entry = (size_t) n_layer_ * n_expert_;
         cvalid_.assign(n_entry, 0);
         cstamp_.assign(n_entry, 0);
+        if (slab_mode_) {
+            cloc_.assign(n_entry, -2);
+            spec_slot_.assign(n_entry, -1);
+            // Physical slab slots stay hot and pre-faulted; per-token MADV_FREE / vm_reclaim would
+            // re-introduce TLB shootdowns and page-dirtying overhead on cache hits.
+            pin_ = false;
+        }
         // One pass of the stack, plus the layers route-ahead stages before their compute, is the
         // newest an entry can be and still be in a kernel's or an I/O lane's hands.
         offer_window_ = (uint32_t) n_layer_ + discard_after_ + 1;
         follow_.reset(cache_max_, pin_floor_, offer_window_);
-        disc_.init(n_entry, offer_window_, discard_drop_, discard_wanted_ ? &platform_span_ops() : nullptr,
+        disc_.init(n_entry, offer_window_, discard_drop_,
+                   (!slab_mode_ && discard_wanted_) ? &platform_span_ops() : nullptr,
                    [this](int32_t id, const std::function<void(Span)> & fn) {
+                       if (slab_mode_) return;
                        for (int p = 0; p < ExpertLayout::max_slots; ++p) {
                            uintptr_t b0 = 0, b1 = 0;
                            if (entry_body(id, p, b0, b1)) fn(Span{(void *) b0, (size_t) (b1 - b0)});
@@ -331,12 +453,144 @@ bool ExpertStreamSource::init(const std::vector<std::string> & shard_paths,
     for (int lane = 1; lane < pool_lanes; ++lane)
         io_pool_.emplace_back(&ExpertStreamSource::io_worker, this, lane);
     if (overlap_) lane0_worker_ = std::thread(&ExpertStreamSource::io_worker, this, 0);
+    copy_stop_ = false;
+    copy_gen_ = 0;
+    if (slab_mode_ && slab_stride_ >= (1ull << 20)) {
+        const unsigned hw = std::thread::hardware_concurrency();
+        const int n_copy = hw > 1 ? std::min<int>(3, std::max<int>(1, (int) (hw / 2) - 1)) : 0;
+        for (int i = 0; i < n_copy; ++i)
+            copy_pool_.emplace_back(&ExpertStreamSource::copy_worker, this);
+    }
 
     // effective_direct_ (set where the provider opened) is the run's o_direct fact — see above.
     log_printf(LogLevel::Info,
-               "expert streaming ON  n_expert=%d o_direct=%d io_threads=%d io=%s cache=%zu MiB shards=%d", n_expert_,
-               (int) effective_direct_, io_threads_, provider_->backend_name(), cache_max_ >> 20, n_shards);
+               "expert streaming ON  n_expert=%d o_direct=%d io_threads=%d io=%s cache=%zu MiB slab=%s shards=%d",
+               n_expert_, (int) effective_direct_, io_threads_, provider_->backend_name(), cache_max_ >> 20,
+               slab_mode_ ? "thp" : "off", n_shards);
     return true;
+}
+
+// ── zero-fault THP slab allocator helpers ───────────────────────────────────────────
+int32_t ExpertStreamSource::alloc_slab_slot(bool allow_evict) {
+    if (!slab_free_.empty()) {
+        const int32_t s = slab_free_.top();
+        slab_free_.pop();
+        return s;
+    }
+    if (!allow_evict || slab_cap_ == 0) return -1;
+    // Evict the coldest non-current slab-resident entry so staging never exceeds the bounded pool.
+    int32_t victim = -1;
+    double best_score = 0.0;
+    for (int32_t id = ctail_; id != -1; id = cprev_[id]) {
+        if (cloc_[id] < 0 || cstamp_[id] == cgen_) continue;
+        if (freq_half_life_ <= 0) {
+            victim = id;
+            break;
+        }
+        if (victim == -1 || cfreq_[id] < best_score) {
+            victim = id;
+            best_score = cfreq_[id];
+        }
+    }
+    if (victim == -1) return -1;
+    evict_entry(victim);
+    if (slab_free_.empty()) return -1;
+    const int32_t s = slab_free_.top();
+    slab_free_.pop();
+    return s;
+}
+
+void ExpertStreamSource::push_copy_ops(std::vector<SlabCopyOp> & ops, int32_t e, int32_t s, uint8_t kind) const {
+    constexpr size_t k_chunk = 2ull << 20;
+    for (int p = 0; p < ExpertLayout::max_slots; ++p) {
+        const size_t n = (size_t) slab_proj_nb2_[(size_t) p];
+        if (n == 0) continue;
+        if (copy_pool_.empty() || n <= k_chunk) {
+            ops.push_back({e, s, (int8_t) p, kind, 0, n});
+        } else {
+            for (size_t off = 0; off < n; off += k_chunk)
+                ops.push_back({e, s, (int8_t) p, kind, off, std::min(k_chunk, n - off)});
+        }
+    }
+}
+
+void ExpertStreamSource::exec_copy_op(const SlabCopyOp & op) const {
+    const size_t n = op.len;
+    if (n == 0) return;
+    char * ex = exec_ptr(op.e, op.p) + op.off;
+    char * sl = slab_ptr(op.s, op.p) + op.off;
+    if (op.kind == 0) {
+        std::memcpy(sl, ex, n);
+    } else if (op.kind == 1) {
+        std::memcpy(ex, sl, n);
+    } else {
+        // 64 KiB L2-hot striped swap: 2 DRAM reads + 2 DRAM writes per projection chunk.
+        alignas(64) uint8_t tmp[65536];
+        for (size_t off = 0; off < n; off += sizeof(tmp)) {
+            const size_t chunk = std::min(sizeof(tmp), n - off);
+            std::memcpy(tmp, ex + off, chunk);
+            std::memcpy(ex + off, sl + off, chunk);
+            std::memcpy(sl + off, tmp, chunk);
+        }
+    }
+}
+
+void ExpertStreamSource::copy_worker() {
+    uint64_t seen = 0;
+    for (;;) {
+        const std::vector<SlabCopyOp> * ops = nullptr;
+        size_t total = 0;
+        {
+            std::unique_lock<std::mutex> lk(copy_mtx_);
+            copy_cv_.wait(lk, [&] { return copy_stop_ || copy_gen_ > seen; });
+            if (copy_stop_) return;
+            seen = copy_gen_;
+            ops = copy_cur_ops_;
+            total = copy_total_;
+        }
+        size_t local_done = 0;
+        for (;;) {
+            const size_t idx = copy_next_.fetch_add(1, std::memory_order_relaxed);
+            if (idx >= total) break;
+            exec_copy_op((*ops)[idx]);
+            ++local_done;
+        }
+        if (local_done > 0) {
+            std::lock_guard<std::mutex> lk(copy_mtx_);
+            copy_done_ += local_done;
+            if (copy_done_ == copy_total_) copy_done_cv_.notify_one();
+        }
+    }
+}
+
+void ExpertStreamSource::run_copy_ops(const std::vector<SlabCopyOp> & ops) {
+    const size_t total = ops.size();
+    if (total == 0) return;
+    if (total == 1 || copy_pool_.empty()) {
+        for (const SlabCopyOp & op : ops)
+            exec_copy_op(op);
+        return;
+    }
+    {
+        std::lock_guard<std::mutex> lk(copy_mtx_);
+        copy_cur_ops_ = &ops;
+        copy_total_ = total;
+        copy_done_ = 0;
+        copy_next_.store(0, std::memory_order_relaxed);
+        ++copy_gen_;
+    }
+    copy_cv_.notify_all();
+    size_t local_done = 0;
+    for (;;) {
+        const size_t idx = copy_next_.fetch_add(1, std::memory_order_relaxed);
+        if (idx >= total) break;
+        exec_copy_op(ops[idx]);
+        ++local_done;
+    }
+    std::unique_lock<std::mutex> lk(copy_mtx_);
+    copy_done_ += local_done;
+    copy_done_cv_.wait(lk, [&] { return copy_done_ == copy_total_; });
+    copy_cur_ops_ = nullptr;
 }
 
 // One readiness cell per (projection, expert), and a map from each bound expert tensor (the
@@ -618,11 +872,18 @@ void ExpertStreamSource::prefetch(int il, const int32_t * ids, int n_ids) {
         const size_t mark = staged.size();
         int njobs = 0;
         bool ok = true;
+        int32_t sslot = -1;
+        if (slab_mode_) {
+            sslot = alloc_slab_slot(/*allow_evict=*/false);
+            if (sslot < 0) break; // slab pool full — stop speculating quietly
+            slab_owner_[(size_t) sslot] = id;
+            spec_slot_[id] = sslot;
+        }
         for (int p = 0; p < ExpertLayout::max_slots; ++p) {
             const uint64_t slice = L.proj[p].nb2;
             if (slice == 0) continue;
-            char * dst = (char *) lbuf_[p][il] + (uint64_t) e * slice;
-            if (!commit_slice(il, e, p)) { // low on memory — stop quietly
+            char * dst = slab_mode_ ? slab_ptr(sslot, p) : ((char *) lbuf_[p][il] + (uint64_t) e * slice);
+            if (!slab_mode_ && !commit_slice(il, e, p)) { // low on memory — stop quietly
                 ok = false;
                 break;
             }
@@ -634,10 +895,25 @@ void ExpertStreamSource::prefetch(int il, const int32_t * ids, int n_ids) {
             // Hand back what this expert already committed and drop its jobs: an entry is queued
             // whole or not at all.
             staged.resize(mark);
-            release_entry_pages(id);
+            if (slab_mode_) {
+                if (sslot >= 0) {
+                    slab_owner_[(size_t) sslot] = -1;
+                    slab_free_.push(sslot);
+                    spec_slot_[id] = -1;
+                }
+            } else {
+                release_entry_pages(id);
+            }
             break;
         }
-        if (njobs == 0) continue;
+        if (njobs == 0) {
+            if (slab_mode_ && sslot >= 0) {
+                slab_owner_[(size_t) sslot] = -1;
+                slab_free_.push(sslot);
+                spec_slot_[id] = -1;
+            }
+            continue;
+        }
         if (ever_evicted_[id]) ++rereads_; // same accounting on the speculative path
         staged_ids.push_back(id);
         staged_counts.push_back(njobs);
@@ -743,8 +1019,15 @@ void ExpertStreamSource::quiesce_spec(int adopt_il) {
             std::lock_guard<std::mutex> lk(io_mtx_);
             std::stable_partition(spec_jobs_.begin() + (ptrdiff_t) spec_next_, spec_jobs_.end(),
                                   [&](const IoJob & j) { return j.layer == (int16_t) adopt_il; });
-            for (int32_t id : spec_touched_)
+            for (int32_t id : spec_touched_) {
                 if (id / n_expert_ == adopt_il && spec_remaining_[id] != 0) adopt.push_back(id);
+                if (slab_mode_ && spec_remaining_[id] == 0 && !cvalid_[id] && spec_slot_[id] >= 0) {
+                    const int32_t s = spec_slot_[id];
+                    spec_slot_[id] = -1;
+                    if (slab_owner_[(size_t) s] == id) slab_owner_[(size_t) s] = -1;
+                    slab_free_.push(s);
+                }
+            }
             // Without the full quiesce ever running, spec_touched_ would grow for the whole
             // session; entries fully settled need no release sweep, so drop them here.
             spec_touched_.erase(std::remove_if(spec_touched_.begin(), spec_touched_.end(),
@@ -798,7 +1081,20 @@ void ExpertStreamSource::quiesce_spec(int adopt_il) {
     for (int32_t id : done) {
         if (spec_remaining_[id] != 0 || cvalid_[id]) { // incomplete, or a real read already took it
             spec_remaining_[id] = 0;
+            if (slab_mode_ && spec_slot_[id] >= 0) {
+                const int32_t s = spec_slot_[id];
+                spec_slot_[id] = -1;
+                if (slab_owner_[(size_t) s] == id) slab_owner_[(size_t) s] = -1;
+                slab_free_.push(s);
+            }
             continue;
+        }
+        if (slab_mode_) {
+            const int32_t s = spec_slot_[id];
+            spec_slot_[id] = -1;
+            if (s < 0) continue;
+            cloc_[id] = s;
+            slab_owner_[(size_t) s] = id;
         }
         cvalid_[id] = 1;
         cspec_[id] = 1;  // speculative until a real lookup hits it (then counted useful)
@@ -808,10 +1104,27 @@ void ExpertStreamSource::quiesce_spec(int adopt_il) {
         lru_push_back(id); // cold end: a mispredicted expert is reclaimed before any demanded one
         spec_experts_.fetch_add(1);
     }
-    // Release pages of entries that never finished (a cancelled or failed read).
+    // Release pages (or slab slots) of entries that never finished (a cancelled or failed read).
     for (int32_t id : touched) {
-        if (spec_remaining_[id] == 0) continue; // completed above (or already integrated)
-        release_entry_pages(id);
+        if (spec_remaining_[id] == 0) {
+            if (slab_mode_ && !cvalid_[id] && spec_slot_[id] >= 0) {
+                const int32_t s = spec_slot_[id];
+                spec_slot_[id] = -1;
+                if (slab_owner_[(size_t) s] == id) slab_owner_[(size_t) s] = -1;
+                slab_free_.push(s);
+            }
+            continue; // completed above (or already integrated)
+        }
+        if (slab_mode_) {
+            const int32_t s = spec_slot_[id];
+            spec_slot_[id] = -1;
+            if (s >= 0) {
+                if (slab_owner_[(size_t) s] == id) slab_owner_[(size_t) s] = -1;
+                slab_free_.push(s);
+            }
+        } else {
+            release_entry_pages(id);
+        }
         spec_remaining_[id] = 0;
     }
 }
@@ -849,10 +1162,11 @@ void ExpertStreamSource::maybe_sample_dense() {
 // (brake_cache_budget, lend_cache) without replacing it.
 void ExpertStreamSource::set_cache_budget(size_t bytes) {
     if (cache_max_ == 0) return; // initialised off (shared-slot mode); the LRU buffers do not exist
+    const size_t ceiling = slab_mode_ ? std::min(total_expert_bytes_, slab_max_budget_) : total_expert_bytes_;
     if (bytes > cache_max_) {
         // Growing evicts nothing, so it needs no quiesce — and must not do one: cancelling the
         // speculative reads in flight on every grow would quietly defeat --prefetch.
-        cache_max_ = std::min(bytes, total_expert_bytes_);
+        cache_max_ = std::min(bytes, ceiling);
         follow_.reset(cache_max_, pin_floor_, offer_window_);
         ++cache_resizes_;
         return;
@@ -872,7 +1186,8 @@ void ExpertStreamSource::set_cache_budget(size_t bytes) {
 
 // The live budget to `bytes`, the ceiling untouched: what brake_cache_budget and a loan move.
 void ExpertStreamSource::move_budget(size_t bytes) {
-    bytes = std::max<size_t>(1, std::min(bytes, total_expert_bytes_));
+    const size_t ceiling = slab_mode_ ? std::min(total_expert_bytes_, slab_max_budget_) : total_expert_bytes_;
+    bytes = std::max<size_t>(1, std::min(bytes, ceiling));
     if (bytes == cache_max_) return;
     const bool shrink = bytes < cache_max_;
     if (shrink) quiesce_spec(); // as set_cache_budget: no worker mid-write to an evicted page
@@ -929,7 +1244,18 @@ double ExpertStreamSource::cache_lost_frac(int n) {
             const uint64_t slice = layers_[il].proj[p].nb2;
             if (slice < 2 * page_) continue; // no page of its own to ask about
             // A page wholly inside the slice: the boundary pages are shared with the neighbours.
-            const uintptr_t s = (uintptr_t) lbuf_[p][il] + (uint64_t) e * slice;
+            uintptr_t s = 0;
+            if (slab_mode_) {
+                const int32_t loc = cloc_[id];
+                if (loc == -1)
+                    s = (uintptr_t) exec_ptr(e, p);
+                else if (loc >= 0)
+                    s = (uintptr_t) slab_ptr(loc, p);
+                else
+                    break;
+            } else {
+                s = (uintptr_t) lbuf_[p][il] + (uint64_t) e * slice;
+            }
             const uintptr_t pg = (s + page_ - 1) & ~(uintptr_t) (page_ - 1);
             pio::vm_resident_sample((void *) pg, page_, &sampled, &resident);
             break; // one page per entry: the entry was written whole, so it is lost whole or not at all
@@ -1037,12 +1363,23 @@ const void * ExpertStreamSource::resident_slice(int il, int e, int p, uint64_t &
         p >= ExpertLayout::max_slots || !layers_[il].bound)
         return nullptr;
     const int32_t id = il * n_expert_ + e;
-    if ((size_t) id >= cvalid_.size() || !cvalid_[id] || !lbuf_[p][il]) return nullptr;
+    if ((size_t) id >= cvalid_.size() || !cvalid_[id]) return nullptr;
     // An entry offered to the kernel (cache_discard) may already be gone, and only the eval thread
     // may take one back: for a reader on another thread it is not resident, and a flash read serves.
     if (disc_.offered(id)) return nullptr;
     bytes = layers_[il].proj[p].nb2;
     if (bytes == 0) return nullptr;
+    if (slab_mode_) {
+        const int32_t loc = cloc_[id];
+        if (loc == -1) return exec_ptr(e, p);
+        if (loc >= 0) return slab_ptr(loc, p);
+        bytes = 0;
+        return nullptr;
+    }
+    if (!lbuf_[p][il]) {
+        bytes = 0;
+        return nullptr;
+    }
     return (const char *) lbuf_[p][il] + (uint64_t) e * bytes;
 }
 
@@ -1116,7 +1453,19 @@ void ExpertStreamSource::evict_to_budget(bool spare_current) {
 void ExpertStreamSource::evict_entry(int32_t id) {
     ++evictions_;
     ever_evicted_[id] = 1; // the next read of this entry is the cache paying twice
-    release_entry_pages(id);
+    if (slab_mode_) {
+        const int32_t loc = cloc_[id];
+        if (loc == -1) {
+            const int e = id % n_expert_;
+            if (exec_owner_[(size_t) e] == id) exec_owner_[(size_t) e] = -1;
+        } else if (loc >= 0) {
+            if (slab_owner_[(size_t) loc] == id) slab_owner_[(size_t) loc] = -1;
+            slab_free_.push(loc);
+        }
+        cloc_[id] = -2;
+    } else {
+        release_entry_pages(id);
+    }
     cvalid_[id] = 0;
     cspec_[id] = 0;
     cresident_ -= entry_bytes(id / n_expert_);
@@ -1177,12 +1526,27 @@ void ExpertStreamSource::spec_integrate_done() {
         // re-pushes it. After this snapshot the check cannot rot: re-staging happens only on
         // this same (eval) thread.
         std::lock_guard<std::mutex> lk(io_mtx_);
-        for (int32_t id : spec_done_)
-            if (!cvalid_[id] && spec_remaining_[id] == 0) done.push_back(id);
+        for (int32_t id : spec_done_) {
+            if (!cvalid_[id] && spec_remaining_[id] == 0) {
+                done.push_back(id);
+            } else if (slab_mode_ && cvalid_[id] && spec_remaining_[id] == 0 && spec_slot_[id] >= 0) {
+                const int32_t s = spec_slot_[id];
+                spec_slot_[id] = -1;
+                if (slab_owner_[(size_t) s] == id) slab_owner_[(size_t) s] = -1;
+                slab_free_.push(s);
+            }
+        }
         spec_done_.clear();
         spec_done_pending_.store(0, std::memory_order_relaxed);
     }
     for (int32_t id : done) {
+        if (slab_mode_) {
+            const int32_t s = spec_slot_[id];
+            spec_slot_[id] = -1;
+            if (s < 0) continue;
+            cloc_[id] = s;
+            slab_owner_[(size_t) s] = id;
+        }
         cvalid_[id] = 1;
         cspec_[id] = 1;  // speculative until a real lookup hits it (then counted useful)
         cstamp_[id] = 0; // not used this generation → evictable if the budget is tight
@@ -1470,13 +1834,16 @@ bool ExpertStreamSource::touch_entry(int il, int e, bool & hit, bool promote, in
     // (With commit_only_proj, the caller also contracts to commit the other projections before it
     // emits their jobs; the residency accounting below still covers the whole entry, because the
     // entry lives and is evicted as a unit either way.)
-    for (int p = 0; p < ExpertLayout::max_slots; ++p) {
-        if (commit_only_proj >= 0 && p != commit_only_proj) continue;
-        if (!commit_proj_pages(il, e, p)) return false;
+    if (!slab_mode_) {
+        for (int p = 0; p < ExpertLayout::max_slots; ++p) {
+            if (commit_only_proj >= 0 && p != commit_only_proj) continue;
+            if (!commit_proj_pages(il, e, p)) return false;
+        }
     }
     if (ever_evicted_[id]) ++rereads_; // this entry was resident once; the cache is buying it again
     cvalid_[id] = 1;
     cspec_[id] = 0; // a real read, not speculative
+    if (slab_mode_) cloc_[id] = -2;
     cresident_ += entry_bytes(il);
     admit_entry(id);
     hit = false;
@@ -1505,6 +1872,12 @@ bool ExpertStreamSource::load_layer(int il, const int32_t * ids, int n_ids) {
     // budget is fixed for the run (auto sizes it once at init), so there is nothing to resize here.
     if (cache_max_) quiesce_spec(spec_adopt_ ? il : -1);
 
+    slab_hits_.clear();
+    slab_misses_.clear();
+    hit_free_slots_.clear();
+    vacate_ops_.clear();
+    hit_ops_.clear();
+
     auto stage = [&](int e) -> bool {
         if (cache_max_ == 0) {
             for (int p = 0; p < ExpertLayout::max_slots; ++p) {
@@ -1517,6 +1890,15 @@ bool ExpertStreamSource::load_layer(int il, const int32_t * ids, int n_ids) {
         }
         bool hit = false;
         if (!touch_entry(il, e, hit)) return false;
+        if (slab_mode_) {
+            const int32_t id = il * n_expert_ + e;
+            if (hit) {
+                if (cloc_[id] >= 0) slab_hits_.push_back(e);
+            } else {
+                slab_misses_.push_back(e);
+            }
+            return true;
+        }
         if (hit) return true;
         // A miss: emit this expert's reads, expert-major. The drain below waits on them all, so the
         // order only has to be complete, not clever — unlike the overlap path, where it feeds a
@@ -1567,7 +1949,70 @@ bool ExpertStreamSource::load_layer(int il, const int32_t * ids, int n_ids) {
     account_demand(il, n_unique);
     maybe_sample_dense();
 
+    if (slab_mode_) {
+        // Phase 2: evict cold entries to budget BEFORE vacating exec_slot_ so any old_id sitting
+        // in exec_slot_[e] that is already cold enough to evict is dropped in place with zero copy.
+        regrow_for_load();
+        evict_to_budget(/*spare_current=*/true);
+
+        // Phase 3: vacate surviving old_ids from exec_slot_[e] into slab_pool_ for misses, then
+        // bind the new miss entries into exec_slot_[e] and emit direct reads into exec_slot_.
+        for (int e : slab_misses_) {
+            const int32_t id = il * n_expert_ + e;
+            const int32_t old_id = exec_owner_[(size_t) e];
+            if (old_id >= 0) {
+                const int32_t s = alloc_slab_slot(/*allow_evict=*/true);
+                if (s >= 0) {
+                    cloc_[old_id] = s;
+                    slab_owner_[(size_t) s] = old_id;
+                    exec_owner_[(size_t) e] = -1;
+                    push_copy_ops(vacate_ops_, e, s, /*kind=*/0);
+                } else {
+                    evict_entry(old_id);
+                }
+            }
+            exec_owner_[(size_t) e] = id;
+            cloc_[id] = -1;
+            for (int p = 0; p < ExpertLayout::max_slots; ++p) {
+                const uint64_t slice = L.proj[p].nb2;
+                if (slice == 0) continue;
+                jobs_.push_back({exec_ptr(e, p), L.proj[p].file_off + (uint64_t) e * slice, slice, -1,
+                                 (int16_t) L.proj[p].file_idx, e, (int16_t) il, (int8_t) p, 0});
+            }
+        }
+        run_copy_ops(vacate_ops_);
+
+        // Phase 4: prepare slab-hit copies/swaps into exec_slot_[e]. If there are misses on a
+        // batched provider (io_uring / HTTP), these run inside on_submitted() overlapped with I/O.
+        for (int e : slab_hits_) {
+            const int32_t id = il * n_expert_ + e;
+            const int32_t s = cloc_[id];
+            if (s < 0) continue;
+            const int32_t old_id = exec_owner_[(size_t) e];
+            if (old_id >= 0) {
+                cloc_[old_id] = s;
+                slab_owner_[(size_t) s] = old_id;
+                cloc_[id] = -1;
+                exec_owner_[(size_t) e] = id;
+                push_copy_ops(hit_ops_, e, s, /*kind=*/2);
+            } else {
+                cloc_[id] = -1;
+                exec_owner_[(size_t) e] = id;
+                slab_owner_[(size_t) s] = -1;
+                hit_free_slots_.push_back(s);
+                push_copy_ops(hit_ops_, e, s, /*kind=*/1);
+            }
+        }
+    }
+
     const size_t njobs = jobs_.size();
+    const bool overlap_hit_ops = slab_mode_ && !hit_ops_.empty() && njobs > 0 && provider_->prefers_batch();
+    if (slab_mode_ && !hit_ops_.empty() && !overlap_hit_ops) {
+        run_copy_ops(hit_ops_);
+        for (int32_t s : hit_free_slots_)
+            slab_free_.push(s);
+        hit_free_slots_.clear();
+    }
     mgmt_ns_.fetch_add((long long) std::chrono::duration_cast<std::chrono::nanoseconds>(clock_t_::now() - tm0).count());
     const auto t0 = clock_t_::now();
     if (provider_->prefers_batch()) {
@@ -1577,7 +2022,15 @@ bool ExpertStreamSource::load_layer(int il, const int32_t * ids, int n_ids) {
                 const IoJob & j = jobs_[i];
                 batch_reqs_[i] = BlockReadReq{j.file, j.off, j.nbytes, j.dst, 0, 0};
             }
-            const bool ok = provider_->read_batch(batch_reqs_.data(), njobs);
+            const bool ok =
+                overlap_hit_ops
+                    ? provider_->read_batch(batch_reqs_.data(), njobs, nullptr, [&] { run_copy_ops(hit_ops_); })
+                    : provider_->read_batch(batch_reqs_.data(), njobs);
+            if (overlap_hit_ops) {
+                for (int32_t s : hit_free_slots_)
+                    slab_free_.push(s);
+                hit_free_slots_.clear();
+            }
             if (io_trace_on_) {
                 std::lock_guard<std::mutex> lk(io_trace_mtx_);
                 for (size_t i = 0; i < njobs; ++i) {
@@ -1623,7 +2076,7 @@ bool ExpertStreamSource::load_layer(int il, const int32_t * ids, int n_ids) {
     }
     read_ns_.fetch_add((long long) std::chrono::duration_cast<std::chrono::nanoseconds>(clock_t_::now() - t0).count());
 
-    if (cache_max_) {
+    if (cache_max_ && !slab_mode_) {
         const auto te0 = clock_t_::now();
         regrow_for_load();
         evict_to_budget(/*spare_current=*/true);
@@ -1712,6 +2165,117 @@ bool ExpertStreamSource::load_layer_async(int il, const int32_t * ids, int n_ids
                 jobs_.push_back({(char *) slot_[p] + (uint64_t) e * slice, L.proj[p].file_off + (uint64_t) e * slice,
                                  slice, flag, (int16_t) L.proj[p].file_idx, e, (int16_t) il, (int8_t) p, 0});
             }
+        }
+    } else if (slab_mode_) {
+        slab_hits_.clear();
+        slab_misses_.clear();
+        hit_free_slots_.clear();
+        vacate_ops_.clear();
+        hit_ops_.clear();
+        seen_.assign(seen_.size(), 0);
+        for (int e : staged_) {
+            bool hit = false;
+            if (!touch_entry(il, e, hit, /*promote=*/false, -1)) {
+                fatal_.store(true, std::memory_order_release);
+                return false;
+            }
+            const int32_t id = il * n_expert_ + e;
+            if (hit) {
+                if (cloc_[id] == -1) {
+                    // Direct exec_slot_ hit — already in place, release waiters immediately.
+                    for (int p = 0; p < ExpertLayout::max_slots; ++p)
+                        if (L.proj[p].nb2) mark_ready(p, e);
+                } else {
+                    slab_hits_.push_back(e);
+                }
+            } else {
+                seen_[e] = 1;
+                slab_misses_.push_back(e);
+            }
+        }
+        if (!load_all_) {
+            for (int i = 0; i < n_ids; ++i) {
+                const int e = ids[i];
+                if (e < 0 || e >= n_expert_) continue;
+                const int32_t id = il * n_expert_ + e;
+                if (!cvalid_[id]) continue;
+                if (cold_gen_[id] == cgen_) continue;
+                lru_unlink(id);
+                lru_push_front(id);
+            }
+        }
+        regrow_for_load();
+        evict_to_budget(/*spare_current=*/true);
+
+        for (int e : slab_misses_) {
+            const int32_t id = il * n_expert_ + e;
+            const int32_t old_id = exec_owner_[(size_t) e];
+            if (old_id >= 0) {
+                const int32_t s = alloc_slab_slot(/*allow_evict=*/true);
+                if (s >= 0) {
+                    cloc_[old_id] = s;
+                    slab_owner_[(size_t) s] = old_id;
+                    exec_owner_[(size_t) e] = -1;
+                    push_copy_ops(vacate_ops_, e, s, /*kind=*/0);
+                } else {
+                    evict_entry(old_id);
+                }
+            }
+            exec_owner_[(size_t) e] = id;
+            cloc_[id] = -1;
+        }
+        run_copy_ops(vacate_ops_);
+
+        // Emit projection-major miss jobs into exec_slot_ and publish BEFORE running hit_ops_ so
+        // I/O lanes start reading misses immediately while this thread stages slab hits.
+        for (int p = 0; p < ExpertLayout::max_slots; ++p) {
+            const uint64_t slice = L.proj[p].nb2;
+            if (slice == 0) continue;
+            for (int e : staged_) {
+                if (!seen_[e]) continue;
+                const int32_t flag = (int32_t) ((size_t) p * (size_t) n_expert_ + (size_t) e);
+                jobs_.push_back({exec_ptr(e, p), L.proj[p].file_off + (uint64_t) e * slice, slice, flag,
+                                 (int16_t) L.proj[p].file_idx, e, (int16_t) il, (int8_t) p, 0});
+            }
+        }
+        {
+            std::lock_guard<std::mutex> lk(io_mtx_);
+            batch_njobs_ = jobs_.size();
+            next_idx_ = 0;
+            done_cnt_ = 0;
+            io_err_.store(false);
+            batch_flag_gen_ = gen;
+            ++batch_gen_;
+        }
+        io_cv_.notify_all();
+        published = true;
+
+        for (int e : slab_hits_) {
+            const int32_t id = il * n_expert_ + e;
+            const int32_t s = cloc_[id];
+            if (s < 0) continue;
+            const int32_t old_id = exec_owner_[(size_t) e];
+            if (old_id >= 0) {
+                cloc_[old_id] = s;
+                slab_owner_[(size_t) s] = old_id;
+                cloc_[id] = -1;
+                exec_owner_[(size_t) e] = id;
+                push_copy_ops(hit_ops_, e, s, /*kind=*/2);
+            } else {
+                cloc_[id] = -1;
+                exec_owner_[(size_t) e] = id;
+                slab_owner_[(size_t) s] = -1;
+                hit_free_slots_.push_back(s);
+                push_copy_ops(hit_ops_, e, s, /*kind=*/1);
+            }
+        }
+        run_copy_ops(hit_ops_);
+        for (int32_t s : hit_free_slots_)
+            slab_free_.push(s);
+        hit_free_slots_.clear();
+        for (int e : slab_hits_) {
+            for (int p = 0; p < ExpertLayout::max_slots; ++p)
+                if (L.proj[p].nb2) mark_ready(p, e);
         }
     } else {
         // Cache on: per-expert LRU bookkeeping (hit → mark all projections ready now; miss →
@@ -1846,7 +2410,7 @@ bool ExpertStreamSource::load_layer_async(int il, const int32_t * ids, int n_ids
     // 5. Evict cold entries to budget. Safe to run concurrently with this batch's reads: step 1
     //    guaranteed no stale in-flight jobs, and current-gen entries (cstamp_ == cgen_) — the
     //    ones just staged — are never chosen, so eviction only releases pages nobody is reading.
-    if (cache_max_) {
+    if (cache_max_ && !slab_mode_) {
         regrow_for_load();
         evict_to_budget(/*spare_current=*/true);
     }
@@ -2005,15 +2569,45 @@ void ExpertStreamSource::shutdown() {
         if (t.joinable()) t.join();
     io_pool_.clear();
     if (lane0_worker_.joinable()) lane0_worker_.join();
+    if (!copy_pool_.empty()) {
+        {
+            std::lock_guard<std::mutex> lk(copy_mtx_);
+            copy_stop_ = true;
+        }
+        copy_cv_.notify_all();
+        for (auto & t : copy_pool_)
+            if (t.joinable()) t.join();
+        copy_pool_.clear();
+    }
     spec_done_.clear();
     spec_done_pending_.store(0, std::memory_order_relaxed);
     spec_touched_.clear();
 
     for (int p = 0; p < ExpertLayout::max_slots; ++p)
         if (slot_[p]) {
-            pio::aligned_free(slot_[p]);
+            pio::vm_release(slot_[p], slot_sz_[p]);
             slot_[p] = nullptr;
+            slot_sz_[p] = 0;
         }
+    for (int p = 0; p < ExpertLayout::max_slots; ++p)
+        if (exec_slot_[p]) {
+            pio::vm_release(exec_slot_[p], exec_slot_sz_[p]);
+            exec_slot_[p] = nullptr;
+            exec_slot_sz_[p] = 0;
+        }
+    if (slab_pool_) {
+        pio::vm_release(slab_pool_, slab_pool_sz_);
+        slab_pool_ = nullptr;
+        slab_pool_sz_ = 0;
+    }
+    slab_mode_ = false;
+    slab_cap_ = 0;
+    slab_max_budget_ = 0;
+    exec_owner_.clear();
+    slab_owner_.clear();
+    cloc_.clear();
+    spec_slot_.clear();
+    slab_free_ = decltype(slab_free_){};
     for (int p = 0; p < ExpertLayout::max_slots; ++p) {
         for (int il = 0; il < (int) lbuf_[p].size(); ++il)
             if (lbuf_[p][il]) pio::vm_release(lbuf_[p][il], lbuf_sz_[p][il]);

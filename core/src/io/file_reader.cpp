@@ -100,14 +100,16 @@ bool FileReader::open(const std::string & path, int lanes, bool direct, size_t m
         if (aligned_reads_ && !pio::fd_ok(fds_buf_[lane]))
             log_printf(LogLevel::Warn, "lane %d buffered tail fd unavailable — EOF-tail reads will fail", lane);
         // No bounce where reads stay plain (Apple F_NOCACHE): a per-lane aligned reservation next to
-        // the expert cache would buy nothing there.
-        bounces_[lane] = aligned_reads_ ? pio::alloc_aligned(align_, bounce_cap) : nullptr;
+        // the expert cache would buy nothing there. Where aligned direct reads are active, allocate
+        // pre-faulted THP-advised bounce buffers to avoid minor faults and TLB churn.
+        size_t alloc_sz = 0;
+        bounces_[lane] = aligned_reads_ ? pio::alloc_thp_buffer(bounce_cap, align_, bounce_cap, &alloc_sz) : nullptr;
         if (aligned_reads_ && !bounces_[lane]) {
             log_printf(LogLevel::Error, "lane %d bounce alloc failed", lane);
             close();
             return false;
         }
-        bounce_sz_[lane] = aligned_reads_ ? bounce_cap : 0;
+        bounce_sz_[lane] = aligned_reads_ ? alloc_sz : 0;
     }
     return true;
 }
@@ -156,15 +158,16 @@ long long FileReader::read(int lane, void * dst, uint64_t off, uint64_t nbytes) 
         // Clear the size BEFORE the allocation: on failure the lane must look empty, not keep
         // advertising the freed buffer's capacity — a later smaller read would skip the realloc and
         // pread into a null pointer, turning one transient OOM into a permanently dead lane.
-        if (bounces_[lane]) pio::aligned_free(bounces_[lane]);
+        if (bounces_[lane] && bounce_sz_[lane]) pio::vm_release(bounces_[lane], bounce_sz_[lane]);
         bounces_[lane] = nullptr;
         bounce_sz_[lane] = 0;
-        bounces_[lane] = pio::alloc_aligned(align_, len);
+        size_t alloc_sz = 0;
+        bounces_[lane] = pio::alloc_thp_buffer(len, align_, len, &alloc_sz);
         if (!bounces_[lane]) {
             log_printf(LogLevel::Error, "bounce realloc %zu failed", len);
             return -1;
         }
-        bounce_sz_[lane] = len;
+        bounce_sz_[lane] = alloc_sz;
     }
     char * b = (char *) bounces_[lane];
     const pio::fd_t fd_buf = fds_buf_[lane];
@@ -223,8 +226,8 @@ void FileReader::close() {
         if (pio::fd_ok(fd)) pio::close_fd(fd);
     for (pio::fd_t fd : fds_buf_)
         if (pio::fd_ok(fd)) pio::close_fd(fd);
-    for (void * b : bounces_)
-        if (b) pio::aligned_free(b);
+    for (size_t i = 0; i < bounces_.size(); ++i)
+        if (bounces_[i] && bounce_sz_[i]) pio::vm_release(bounces_[i], bounce_sz_[i]);
     fds_.clear();
     fds_buf_.clear();
     bounces_.clear();

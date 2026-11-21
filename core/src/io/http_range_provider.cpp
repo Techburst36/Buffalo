@@ -776,12 +776,17 @@ void HttpRangeProvider::batch_worker(int lane) {
 
 bool HttpRangeProvider::read_batch(BlockReadReq * reqs,
                                    size_t count,
-                                   const std::function<void(size_t idx, bool ok)> & on_complete) {
-    if (count == 0) return true;
+                                   const std::function<void(size_t idx, bool ok)> & on_complete,
+                                   const std::function<void()> & on_submitted) {
+    if (count == 0) {
+        if (on_submitted) on_submitted();
+        return true;
+    }
     if (!open_ || !reqs) return false;
 
     // Fast path for a single request or single-lane provider: run directly on lane 0.
     if (count == 1 || workers_.empty()) {
+        if (on_submitted) on_submitted();
         bool all_ok = true;
         for (size_t i = 0; i < count; ++i) {
             BlockReadReq & r = reqs[i];
@@ -809,6 +814,7 @@ bool HttpRangeProvider::read_batch(BlockReadReq * reqs,
         ++batch_gen_;
     }
     worker_cv_.notify_all();
+    if (on_submitted) on_submitted();
 
     // Calling thread participates as lane 0 while worker threads execute lanes 1..lanes_-1.
     execute_batch_slot(0);

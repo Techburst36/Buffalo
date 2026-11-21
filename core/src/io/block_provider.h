@@ -62,11 +62,14 @@ public:
     virtual long long read(int lane, int shard, void * dst, uint64_t off, uint64_t nbytes) = 0;
 
     // Batched read of `count` requests across shards. If `on_complete` is provided, it is invoked
-    // once per request as each completes (with its request index and success flag).
+    // once per request as each completes (with its request index and success flag). If
+    // `on_submitted` is provided, it is invoked once after the initial wave of asynchronous reads
+    // has been submitted to the OS/network so the caller can overlap CPU work with I/O latency.
     // Default implementation executes sequentially via read(0, ...).
     virtual bool read_batch(BlockReadReq * reqs,
                             size_t count,
-                            const std::function<void(size_t idx, bool ok)> & on_complete = nullptr);
+                            const std::function<void(size_t idx, bool ok)> & on_complete = nullptr,
+                            const std::function<void()> & on_submitted = nullptr);
 
     virtual long long read_bytes() const = 0;
     virtual long long io_ns() const = 0;
