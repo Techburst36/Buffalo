@@ -135,8 +135,8 @@ bool ExpertStreamSource::init(const std::vector<std::string> & shard_paths,
         // dense set twice and overcommits by its whole size — enough to take the device down on a
         // model whose dense set is large (DeepSeek V4's is ~6.5 GiB). Budget as if the conversion
         // had already happened.
-        const bool remote_model = is_remote_url(shard_paths[0]);
-        if (!remote_model &&
+        const bool already_resident = is_remote_url(shard_paths[0]) || cfg.dense_stream;
+        if (!already_resident &&
             (cfg.dense_weights == DenseWeightsMode::Anonymous || cfg.dense_weights == DenseWeightsMode::Pinned)) {
             uint64_t dense_pending = 0;
             // The same rule dense_.init applies below: a tensor larger than what is available is
@@ -312,8 +312,9 @@ bool ExpertStreamSource::init(const std::vector<std::string> & shard_paths,
             ranges[(size_t) s] = DenseWeights::byte_ranges(std::move(exp[(size_t) s]), provider_->shard_size(s));
         dense_.set_row_gathered(std::move(row_tensors_), row_budget_);
         dense_.set_mapped(cfg.dense_mapped);
+        const bool already_resident = is_remote_url(shard_paths[0]) || cfg.dense_stream;
         if (!dense_.init(cfg.dense_weights, shard_paths, std::move(ranges), std::move(dense_tensors_),
-                         cfg.io_backend, http_opt)) {
+                         cfg.io_backend, http_opt, already_resident)) {
             log_printf(LogLevel::Error, "dense-weights init failed");
             return false;
         }

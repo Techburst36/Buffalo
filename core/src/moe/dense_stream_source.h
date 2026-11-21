@@ -110,6 +110,7 @@ private:
         uint64_t span_bytes = 0;
         GroupState state = GroupState::Evicted;
         bool pinned = false;
+        bool static_pinned = false; // permanently pinned prefix group; loaded once, never evicted
         bool prefetched = false;
         uint64_t lru_tick = 0;
     };
@@ -118,7 +119,7 @@ private:
 
     void evict_group_vm(Group & g);
     void evict_unpinned_locked(uint64_t need_bytes);
-    uint64_t pinned_or_loading_bytes_locked() const;
+    uint64_t unevictable_bytes_locked() const;
     bool load_group_io(Group & g, uint64_t & out_bytes_read);
     void prefetch_worker_main();
 
@@ -135,6 +136,8 @@ private:
 
     uint64_t total_weight_bytes_ = 0;
     uint64_t budget_bytes_ = 0;
+    uint64_t static_pinned_groups_ = 0;
+    uint64_t static_pinned_bytes_ = 0;
 
     mutable std::mutex mtx_;
     std::condition_variable cv_;

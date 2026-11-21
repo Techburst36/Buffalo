@@ -349,6 +349,7 @@ void test_pure_dense_local(const std::string & qwen3_path, GenCapture & out_base
           "qwen3 resident baseline generated " + std::to_string(out_baseline.pieces.size()) + " tokens");
 
     // 1a. Posix --dense-stream --dense-cache-mb 6
+    uint64_t posix_6mb_read = 0;
     {
         SessionConfig cfg = base_cfg;
         cfg.moe.dense_stream = true;
@@ -359,9 +360,11 @@ void test_pure_dense_local(const std::string & qwen3_path, GenCapture & out_base
         const bool ok = compare_captures(out_baseline, got, 1e-6f, diag);
         check(ok, "qwen3 Posix dense-cache-mb=6 parity: " + diag);
         const DenseStreamStats & st = got.dense_stats;
-        std::printf("  [Posix 6MiB] total=%.2f MiB, budget=%.2f MiB, peak=%.2f MiB, read=%.2f MiB, "
-                    "loaded=%llu, evicted=%llu, prefetch_hits=%llu\n",
+        posix_6mb_read = st.bytes_read;
+        std::printf("  [Posix 6MiB] total=%.2f MiB, budget=%.2f MiB, static_pinned=%.2f MiB (%llu groups), "
+                    "peak=%.2f MiB, read=%.2f MiB, loaded=%llu, evicted=%llu, prefetch_hits=%llu\n",
                     st.total_streamed_weight_bytes / 1048576.0, st.budget_bytes / 1048576.0,
+                    st.static_pinned_bytes / 1048576.0, (unsigned long long) st.static_pinned_groups,
                     st.peak_resident_bytes / 1048576.0, st.bytes_read / 1048576.0,
                     (unsigned long long) st.groups_loaded, (unsigned long long) st.groups_evicted,
                     (unsigned long long) st.prefetch_hits);
@@ -374,6 +377,7 @@ void test_pure_dense_local(const std::string & qwen3_path, GenCapture & out_base
     }
 
     // 1b. io_uring --dense-stream --dense-cache-mb 6
+    uint64_t iouring_6mb_read = 0;
     {
         SessionConfig cfg = base_cfg;
         cfg.moe.dense_stream = true;
@@ -384,9 +388,11 @@ void test_pure_dense_local(const std::string & qwen3_path, GenCapture & out_base
         const bool ok = compare_captures(out_baseline, got, 1e-6f, diag);
         check(ok, "qwen3 io_uring dense-cache-mb=6 parity: " + diag);
         const DenseStreamStats & st = got.dense_stats;
-        std::printf("  [io_uring 6MiB] total=%.2f MiB, budget=%.2f MiB, peak=%.2f MiB, read=%.2f MiB, "
-                    "loaded=%llu, evicted=%llu, prefetch_hits=%llu\n",
+        iouring_6mb_read = st.bytes_read;
+        std::printf("  [io_uring 6MiB] total=%.2f MiB, budget=%.2f MiB, static_pinned=%.2f MiB (%llu groups), "
+                    "peak=%.2f MiB, read=%.2f MiB, loaded=%llu, evicted=%llu, prefetch_hits=%llu\n",
                     st.total_streamed_weight_bytes / 1048576.0, st.budget_bytes / 1048576.0,
+                    st.static_pinned_bytes / 1048576.0, (unsigned long long) st.static_pinned_groups,
                     st.peak_resident_bytes / 1048576.0, st.bytes_read / 1048576.0,
                     (unsigned long long) st.groups_loaded, (unsigned long long) st.groups_evicted,
                     (unsigned long long) st.prefetch_hits);
@@ -394,7 +400,83 @@ void test_pure_dense_local(const std::string & qwen3_path, GenCapture & out_base
               "io_uring: bounded peak RAM, real evictions, and prefetch hits");
     }
 
-    // 1c. Auto 2-layer window (--dense-cache-mb 0) + --row-stream on pure dense model
+    // 1c. Static-pinning anti-thrash proof (--dense-cache-mb 10 on 16.26 MiB 6-layer qwen3)
+    //     + Linux zero-mmap verification on local --dense-stream boot.
+    for (IoBackend backend : {IoBackend::Posix, IoBackend::IoUring}) {
+        const char * bname = backend == IoBackend::Posix ? "Posix" : "io_uring";
+        const uint64_t ref_6mb_read = backend == IoBackend::Posix ? posix_6mb_read : iouring_6mb_read;
+
+        SessionConfig cfg = base_cfg;
+        cfg.moe.dense_stream = true;
+        cfg.moe.dense_cache_mb = 10;
+        cfg.moe.io_backend = backend;
+
+        std::string err;
+        auto sess = Session::open(cfg, err);
+        check(sess != nullptr, std::string("qwen3 ") + bname + " 10MiB opened cleanly" + (err.empty() ? "" : ": " + err));
+        if (sess) {
+#if defined(__linux__)
+            // Confirm local --dense-stream booted via llama_model_init_from_user() with ZERO mmap of the GGUF.
+            std::ifstream maps("/proc/self/maps");
+            std::string line;
+            bool mapped = false;
+            const std::string fname = std::filesystem::path(qwen3_path).filename().string();
+            while (std::getline(maps, line)) {
+                if (line.find(fname) != std::string::npos) {
+                    mapped = true;
+                    break;
+                }
+            }
+            check(!mapped, std::string("qwen3 ") + bname + " local --dense-stream: ZERO mmap of GGUF in /proc/self/maps");
+#endif
+            GenerateRequest req;
+            req.prompt = prompt;
+            req.n_predict = n_predict;
+            req.clear_kv = true;
+            req.render_text = false;
+            req.n_probs = 4;
+
+            GenCapture got;
+            RunResult r = sess->generate(req, [&](const TokenMetrics & m) {
+                got.pieces.push_back(m.piece);
+                if (m.has_logprobs) {
+                    got.chosen_logprobs.push_back(m.logprob);
+                    got.top_logprobs.push_back(m.top_logprobs);
+                }
+            });
+            got.ok = r.ok;
+            got.error = r.error;
+            got.text = r.generated_text;
+            got.dense_stats = sess->dense_stream_stats();
+
+            std::string diag;
+            const bool ok = compare_captures(out_baseline, got, 1e-6f, diag);
+            check(ok, std::string("qwen3 ") + bname + " dense-cache-mb=10 static-pin parity: " + diag);
+
+            const DenseStreamStats & st = got.dense_stats;
+            const double cyclic_full_mib = (13.0 * st.total_streamed_weight_bytes) / 1048576.0;
+            const double saved_vs_cyclic_mib = cyclic_full_mib - (st.bytes_read / 1048576.0);
+            const double saved_vs_6mb_mib = (ref_6mb_read > st.bytes_read) ? ((ref_6mb_read - st.bytes_read) / 1048576.0) : 0.0;
+            std::printf("  [%s 10MiB static-pin] total=%.2f MiB, budget=%.2f MiB, static_pinned=%.2f MiB "
+                        "(%llu groups), peak=%.2f MiB, read=%.2f MiB (vs 6MiB=%.2f MiB, cyclic=%.2f MiB, "
+                        "saved=%.2f MiB vs 6MiB / %.2f MiB vs cyclic), loaded=%llu, evicted=%llu, prefetch_hits=%llu\n",
+                        bname, st.total_streamed_weight_bytes / 1048576.0, st.budget_bytes / 1048576.0,
+                        st.static_pinned_bytes / 1048576.0, (unsigned long long) st.static_pinned_groups,
+                        st.peak_resident_bytes / 1048576.0, st.bytes_read / 1048576.0, ref_6mb_read / 1048576.0,
+                        cyclic_full_mib, saved_vs_6mb_mib, saved_vs_cyclic_mib,
+                        (unsigned long long) st.groups_loaded, (unsigned long long) st.groups_evicted,
+                        (unsigned long long) st.prefetch_hits);
+            check(st.static_pinned_groups >= 2 && st.static_pinned_bytes > (2ull << 20),
+                  std::string(bname) + " 10MiB: prefix layers static-pinned (>= 2 groups, > 2 MiB)");
+            check(st.peak_resident_bytes <= (10ull << 20), std::string(bname) + " 10MiB: peak resident <= 10 MiB");
+            check(st.bytes_read < ref_6mb_read && st.bytes_read + (25ull << 20) < 13ull * st.total_streamed_weight_bytes,
+                  std::string(bname) + " 10MiB: static pinning strictly reduced bytes_read vs 6 MiB and cyclic scan");
+            check(st.groups_evicted > 0 && st.prefetch_hits > 0 && st.io_errors == 0,
+                  std::string(bname) + " 10MiB: rotating tail evicted & prefetched cleanly with 0 errors");
+        }
+    }
+
+    // 1d. Auto 2-layer window (--dense-cache-mb 0) + --row-stream on pure dense model
     {
         SessionConfig cfg = base_cfg;
         cfg.moe.dense_stream = true;

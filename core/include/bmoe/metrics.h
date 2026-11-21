@@ -28,6 +28,8 @@ struct TokenLogprob {
 struct DenseStreamStats {
     uint64_t total_streamed_weight_bytes = 0; // sum of bytes across all managed dense tensors
     uint64_t budget_bytes = 0;                // active resident RAM budget
+    uint64_t static_pinned_groups = 0;        // prefix groups permanently pinned (never evicted)
+    uint64_t static_pinned_bytes = 0;         // sum of bytes across static-pinned groups
     uint64_t bytes_read = 0;                  // cumulative bytes read from BlockProvider
     uint64_t groups_loaded = 0;               // total group loads completed (sync + prefetch)
     uint64_t groups_evicted = 0;              // total group evictions via pio::vm_evict()

@@ -1371,7 +1371,15 @@ int main(int argc, char ** argv) {
                 std::snprintf(cache, sizeof(cache), "cache %d MiB", cfg.moe.cache_mb);
             else
                 std::snprintf(cache, sizeof(cache), "cache off");
-            std::printf("mode: expert streaming, %s, dense %s%s\n", cache, dense, cfg.moe.overlap ? ", overlap" : "");
+            std::printf("mode: expert streaming, %s, dense %s%s%s\n", cache, dense,
+                        cfg.moe.overlap ? ", overlap" : "", cfg.moe.dense_stream ? ", dense-stream" : "");
+        } else if (cfg.moe.dense_stream) {
+            char dcache[64];
+            if (cfg.moe.dense_cache_mb > 0)
+                std::snprintf(dcache, sizeof(dcache), "%d MiB", cfg.moe.dense_cache_mb);
+            else
+                std::snprintf(dcache, sizeof(dcache), "auto");
+            std::printf("mode: dense streaming, cache %s (no mmap)\n", dcache);
         } else if (s.n_expert > 1) {
             std::printf("mode: mmap. Expert streaming is OFF on a MoE model (%s, %d experts), so this run is a "
                         "baseline, not this engine: add --moe-stream --overlap to stream the routed "
@@ -1466,6 +1474,17 @@ int main(int argc, char ** argv) {
                             s.n_generated ? s.route_ahead_wd_ns / 1e6 / s.n_generated : 0.0);
         }
         if (cfg.moe.predict_log) print_predict_report(s);
+    }
+    if (cfg.moe.dense_stream && s.dense_stream.total_streamed_weight_bytes > 0) {
+        const DenseStreamStats & ds = s.dense_stream;
+        std::printf("dense-stream: %.1f MiB streamed, %.1f MiB static-pinned (%llu groups), "
+                    "read %.1f MiB, peak %.1f MiB, %llu prefetch hits\n",
+                    ds.total_streamed_weight_bytes / (1024.0 * 1024.0),
+                    ds.static_pinned_bytes / (1024.0 * 1024.0),
+                    (unsigned long long) ds.static_pinned_groups,
+                    ds.bytes_read / (1024.0 * 1024.0),
+                    ds.peak_resident_bytes / (1024.0 * 1024.0),
+                    (unsigned long long) ds.prefetch_hits);
     }
     return 0;
 }

@@ -37,22 +37,25 @@ bool DenseWeights::init(DenseWeightsMode mode,
                         std::vector<std::vector<std::pair<uint64_t, uint64_t>>> ranges,
                         std::vector<DenseTensorRef> tensors,
                         IoBackend io_backend,
-                        const HttpProviderOptions & http_opt) {
+                        const HttpProviderOptions & http_opt,
+                        bool already_resident) {
     mode_ = mode;
     io_backend_ = io_backend;
     http_opt_ = http_opt;
     paths_ = paths;
     remote_ = !paths_.empty() && is_remote_url(paths_[0]);
+    no_mmap_ = remote_ || already_resident;
     ranges_ = std::move(ranges);
     tensors_ = std::move(tensors);
     index_mapping();
 
-    // Remote HTTP models already fetched their dense weights into anonymous RAM / GPU memory
-    // during llama_model_init_from_user(); there is no local file mapping to warm, drop, or copy.
-    if (remote_) {
+    // Models booted via llama_model_init_from_user() (remote HTTP or local --dense-stream)
+    // already fetched their tiny resident dense weights into anonymous RAM / GPU memory; there is
+    // no local file mapping to warm, drop, or copy. Still run take_row_gathered() for --row-stream.
+    if (no_mmap_) {
         take_row_gathered();
-        log_printf(LogLevel::Info, "dense-weights=%s — remote HTTP model dense weights already resident",
-                   dense_weights_mode_name(mode_));
+        log_printf(LogLevel::Info, "dense-weights=%s — %s dense weights already resident (no mmap)",
+                   dense_weights_mode_name(mode_), remote_ ? "remote HTTP model" : "user-loaded model");
         return true;
     }
 
@@ -169,7 +172,7 @@ bool DenseWeights::reopen_readers() {
 }
 
 bool DenseWeights::file_mapping_in_use() const {
-    if (remote_) return false;
+    if (no_mmap_) return false;
     if (!mapped_.empty()) return true;
     return (mode_ == DenseWeightsMode::Mmap || mode_ == DenseWeightsMode::Warmed) && !tensors_.empty();
 }

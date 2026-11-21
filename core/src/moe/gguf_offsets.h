@@ -122,4 +122,14 @@ RemoteGgufMeta read_remote_gguf_meta(const char * url,
                                      int lanes = 0,
                                      const HttpProviderOptions & http_opt = {});
 
+// Zero-mmap local GGUF metadata + BlockProvider for llama_model_init_from_user() (--dense-stream).
+// Reads only GGUF headers/tensor descriptors across single or split shards (never calls mmap or
+// reads tensor payloads), merges split tensor manifests into one gguf_context (split.count = 1),
+// and opens a local BlockProvider respecting `io_backend` and `direct`.
+RemoteGgufMeta read_local_gguf_for_user(const char * path,
+                                        int lanes,
+                                        bool direct,
+                                        size_t max_read,
+                                        IoBackend io_backend = IoBackend::Auto);
+
 } // namespace bmoe

@@ -558,6 +558,93 @@ RemoteGgufMeta read_remote_gguf_meta(const char * url, int lanes, const HttpProv
     return out;
 }
 
+RemoteGgufMeta read_local_gguf_for_user(const char * path,
+                                        int lanes,
+                                        bool direct,
+                                        size_t max_read,
+                                        IoBackend io_backend) {
+    RemoteGgufMeta out;
+    if (!path || !*path) {
+        out.error = "empty local model path";
+        return out;
+    }
+
+    std::string prefix;
+    const int split_count = split_count_from_path(path, prefix);
+    if (split_count < 0) {
+        out.error = std::string(path) + " is not the first shard (-00001-of-) of a split model";
+        return out;
+    }
+
+    std::vector<std::string> shard_paths;
+    shard_paths.push_back(path);
+    for (int no = 2; no <= split_count; ++no)
+        shard_paths.push_back(make_shard_path(prefix, no, split_count));
+
+    // Parse shard 0 metadata only (no_alloc = true; never mmaps or reads tensor payloads).
+    gguf_context * merged = open_meta(shard_paths[0].c_str());
+    if (!merged) {
+        out.error = std::string("failed to parse GGUF metadata: ") + shard_paths[0];
+        return out;
+    }
+    out.gguf_ctx.reset(merged);
+
+    fill_model_info(merged, out.meta.info);
+    fill_offsets(merged, 0, out.meta.offsets);
+    out.meta.offsets.shard_paths = shard_paths;
+
+    const int declared_splits = meta_int(merged, "split.count", 1);
+    if (declared_splits > 1 && shard_paths.size() == 1) {
+        out.error = std::string("GGUF declares split.count=") + std::to_string(declared_splits) +
+                    ", but path does not follow -00001-of-NNNNN.gguf naming: " + path;
+        out.gguf_ctx.reset();
+        return out;
+    }
+
+    // Merge sibling split shards into the single gguf_context for llama_model_init_from_user(),
+    // while retaining real per-shard file indices and byte offsets in out.meta.offsets.
+    for (int s = 1; s < (int) shard_paths.size(); ++s) {
+        ggml_context * tmp_ctx = nullptr;
+        gguf_init_params gp{};
+        gp.no_alloc = true;
+        gp.ctx = &tmp_ctx;
+        gguf_context * shard_gguf = gguf_init_from_file(shard_paths[(size_t) s].c_str(), gp);
+        if (!shard_gguf) {
+            if (tmp_ctx) ggml_free(tmp_ctx);
+            out.error = "split model is missing or unreadable shard " + shard_paths[(size_t) s];
+            out.gguf_ctx.reset();
+            return out;
+        }
+        fill_offsets(shard_gguf, s, out.meta.offsets);
+        if (tmp_ctx) {
+            for (ggml_tensor * t = ggml_get_first_tensor(tmp_ctx); t; t = ggml_get_next_tensor(tmp_ctx, t)) {
+                if (gguf_find_tensor(merged, t->name) == -1) gguf_add_tensor(merged, t);
+            }
+            ggml_free(tmp_ctx);
+        }
+        gguf_free(shard_gguf);
+    }
+
+    if (shard_paths.size() > 1) {
+        gguf_set_val_u16(merged, "split.count", 1);
+        gguf_set_val_u16(merged, "split.no", 0);
+        gguf_set_val_i32(merged, "split.tensors.count", (int32_t) gguf_get_n_tensors(merged));
+    }
+
+    const int eff_lanes = std::max(1, lanes);
+    out.provider = open_local_block_provider(shard_paths, eff_lanes, direct, max_read, io_backend);
+    if (!out.provider) {
+        out.error = std::string("failed to open local block provider for ") + path;
+        out.gguf_ctx.reset();
+        return out;
+    }
+
+    out.meta.offsets.ok = true;
+    out.meta.ok = true;
+    out.ok = true;
+    return out;
+}
+
 GgufOffsets read_gguf_offsets(const char * path) {
     if (path && is_remote_url(path)) return read_remote_gguf_meta(path).meta.offsets;
     GgufOffsets out;

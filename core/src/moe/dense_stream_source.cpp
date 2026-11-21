@@ -192,6 +192,35 @@ bool DenseStreamSource::init(const std::vector<std::string> & shard_paths,
         if (budget_bytes_ == 0) budget_bytes_ = top1;
     }
 
+    // Cyclic-scan anti-thrashing policy: when total_weight_bytes_ > budget_bytes_, pure LRU over
+    // a cyclic layer scan (0 -> 1 -> ... -> N-1 -> 0) gets a 0% hit rate because later layers
+    // evict layer 0 before the next token loops back. Reserve the working window needed by the
+    // rotating tail (2 * max_group_bytes for 1-layer look-ahead, or 1 * max_group_bytes in
+    // starvation mode) and permanently static-pin the earliest groups in execution order that fit
+    // in the remaining pin_budget. Static-pinned groups load once on token 1 and are never evicted.
+    static_pinned_groups_ = 0;
+    static_pinned_bytes_ = 0;
+    if (total_weight_bytes_ > budget_bytes_ && top1 > 0) {
+        const uint64_t stream_window = (budget_bytes_ >= 2 * top1) ? (2 * top1) : top1;
+        if (budget_bytes_ > stream_window) {
+            const uint64_t pin_budget = budget_bytes_ - stream_window;
+            std::vector<int> exec_order;
+            exec_order.reserve(n_groups);
+            if (group_has_tensors(embd_group_)) exec_order.push_back(embd_group_);
+            for (int il = 0; il < n_layer_; ++il)
+                if (group_has_tensors(il)) exec_order.push_back(il);
+            if (group_has_tensors(head_group_)) exec_order.push_back(head_group_);
+
+            for (int gid : exec_order) {
+                Group & g = groups_[(size_t) gid];
+                if (static_pinned_bytes_ + g.total_bytes > pin_budget) break;
+                g.static_pinned = true;
+                static_pinned_bytes_ += g.total_bytes;
+                ++static_pinned_groups_;
+            }
+        }
+    }
+
     fatal_.store(false, std::memory_order_relaxed);
     prefetch_stop_ = false;
     prefetch_target_ = -1;
@@ -209,9 +238,10 @@ bool DenseStreamSource::init(const std::vector<std::string> & shard_paths,
 
     log_printf(LogLevel::Info,
                "dense-stream: %zu tensor(s) in %zu group(s), %.2f MiB total, budget %.2f MiB (%s), "
-               "provider=%s%s%llu MiB mmap dropped",
+               "static-pinned %.2f MiB (%llu group(s)), provider=%s%s%llu MiB mmap dropped",
                n_tensors, n_groups, (double) total_weight_bytes_ / (1024.0 * 1024.0),
                (double) budget_bytes_ / (1024.0 * 1024.0), cfg.dense_cache_mb > 0 ? "explicit" : "auto 2-layer",
+               (double) static_pinned_bytes_ / (1024.0 * 1024.0), (unsigned long long) static_pinned_groups_,
                provider_->backend_name(), dropped_mmap ? ", " : ", ", (unsigned long long) (dropped_mmap >> 20));
     return true;
 }
@@ -245,6 +275,8 @@ void DenseStreamSource::shutdown() {
     resident_bytes_ = 0;
     total_weight_bytes_ = 0;
     budget_bytes_ = 0;
+    static_pinned_groups_ = 0;
+    static_pinned_bytes_ = 0;
 }
 
 bool DenseStreamSource::reopen_readers() {
@@ -289,10 +321,11 @@ void DenseStreamSource::evict_group_vm(Group & g) {
     }
 }
 
-uint64_t DenseStreamSource::pinned_or_loading_bytes_locked() const {
+uint64_t DenseStreamSource::unevictable_bytes_locked() const {
     uint64_t sum = 0;
     for (const Group & g : groups_) {
-        if (g.pinned || g.state == GroupState::Loading) sum += g.total_bytes;
+        if (g.pinned || g.state == GroupState::Loading || (g.static_pinned && g.state == GroupState::Resident))
+            sum += g.total_bytes;
     }
     return sum;
 }
@@ -303,12 +336,12 @@ void DenseStreamSource::evict_unpinned_locked(uint64_t need_bytes) {
         uint64_t oldest = UINT64_MAX;
         for (int i = 0; i < (int) groups_.size(); ++i) {
             const Group & g = groups_[(size_t) i];
-            if (g.state == GroupState::Resident && !g.pinned && g.lru_tick < oldest) {
+            if (g.state == GroupState::Resident && !g.pinned && !g.static_pinned && g.lru_tick < oldest) {
                 oldest = g.lru_tick;
                 victim = i;
             }
         }
-        if (victim < 0) break; // only pinned/loading groups remain; never evict them
+        if (victim < 0) break; // only pinned/static-pinned/loading groups remain; never evict them
         Group & vg = groups_[(size_t) victim];
         evict_group_vm(vg);
         vg.state = GroupState::Evicted;
@@ -446,10 +479,10 @@ void DenseStreamSource::prefetch_group_async(int next_g) {
         if (prefetch_stop_ || prefetch_target_ >= 0) return;
         Group & grp = groups_[(size_t) next_g];
         if (grp.tensors.empty() || grp.state != GroupState::Evicted) return;
-        // Only enqueue look-ahead when the next group fits alongside all currently pinned or
-        // in-flight groups inside budget_bytes_. Under extreme 1-layer budgets this cleanly
-        // disables look-ahead instead of thrashing or exceeding the cap.
-        if (pinned_or_loading_bytes_locked() + grp.total_bytes > budget_bytes_) return;
+        // Only enqueue look-ahead when the next group fits alongside all currently unevictable
+        // (active pinned, in-flight, and resident static-pinned) groups inside budget_bytes_.
+        // Under extreme 1-layer budgets this cleanly disables look-ahead instead of thrashing.
+        if (unevictable_bytes_locked() + grp.total_bytes > budget_bytes_) return;
 
         grp.state = GroupState::Loading;
         grp.prefetched = true;
@@ -503,6 +536,8 @@ DenseStreamStats DenseStreamSource::stats() const {
     std::lock_guard<std::mutex> lk(mtx_);
     s.total_streamed_weight_bytes = total_weight_bytes_;
     s.budget_bytes = budget_bytes_;
+    s.static_pinned_groups = static_pinned_groups_;
+    s.static_pinned_bytes = static_pinned_bytes_;
     s.bytes_read = bytes_read_;
     s.groups_loaded = groups_loaded_;
     s.groups_evicted = groups_evicted_;

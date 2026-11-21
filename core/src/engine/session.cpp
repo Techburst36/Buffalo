@@ -42,6 +42,7 @@
 #include "ggml-backend.h"
 #include "llama.h"
 #include "ggml.h"
+#include "gguf.h"
 
 // llama.cpp's `common` layer (NOT the stable public API): chat-template rendering and
 // reasoning parsing. See the note in the root CMakeLists / docs/seam.md.
@@ -1050,10 +1051,16 @@ struct Session::Impl::Opening {
     bool gguf_meta_read = false;
     RemoteGgufMeta remote{};
     bool remote_read = false;
-    const RemoteGgufMeta & ensure_remote() {
+    const RemoteGgufMeta & ensure_user_load() {
         if (!remote_read) {
-            const HttpProviderOptions http_opt = http_options_from(cfg.moe);
-            remote = read_remote_gguf_meta(cfg.model_path.c_str(), http_opt.lanes, http_opt);
+            if (is_remote_url(cfg.model_path)) {
+                const HttpProviderOptions http_opt = http_options_from(cfg.moe);
+                remote = read_remote_gguf_meta(cfg.model_path.c_str(), http_opt.lanes, http_opt);
+            } else {
+                constexpr size_t k_boot_chunk = 4ull << 20;
+                remote = read_local_gguf_for_user(cfg.model_path.c_str(), /*lanes=*/1, cfg.moe.o_direct, k_boot_chunk,
+                                                  cfg.moe.io_backend);
+            }
             remote_read = true;
             if (remote.ok) {
                 gguf_meta = remote.meta;
@@ -1064,8 +1071,8 @@ struct Session::Impl::Opening {
     }
     const GgufMeta & meta() {
         if (!gguf_meta_read) {
-            if (is_remote_url(cfg.model_path)) {
-                ensure_remote();
+            if (is_remote_url(cfg.model_path) || cfg.moe.dense_stream) {
+                ensure_user_load();
             } else {
                 gguf_meta = read_gguf_meta(cfg.model_path.c_str());
             }
@@ -1143,12 +1150,18 @@ bool Session::Impl::load_model(Opening & o, llama_model ** reference) {
     mparams.lazy_mode =
         cfg.moe.row_stream || !cfg.moe.dense_mapped.empty() ? LLAMA_LAZY_MODE_OFF : LLAMA_LAZY_MODE_AUTO;
     const bool remote = is_remote_url(cfg.model_path);
+    // Boot through llama_model_init_from_user() + bmoe_virtual_host_buffer_type() for both remote
+    // HTTP URLs AND local --dense-stream models so Linux MAP_POPULATE / MADV_WILLNEED never faults
+    // a >RAM local GGUF into RAM at boot or during capture_warmup(). When --dense-stream is off on
+    // local files, keep the existing mmap loader untouched.
+    const bool use_user_loader = remote || cfg.moe.dense_stream;
     std::vector<std::string> vhost_patterns;
     std::vector<llama_model_tensor_buft_override> buft_overrides;
 
-    if (remote) {
-        const RemoteGgufMeta & rem = o.ensure_remote();
-        if (!rem.ok) return o.fail(rem.error.empty() ? ("cannot open remote GGUF: " + cfg.model_path) : rem.error);
+    if (use_user_loader) {
+        const RemoteGgufMeta & rem = o.ensure_user_load();
+        if (!rem.ok)
+            return o.fail(rem.error.empty() ? ("cannot open GGUF: " + cfg.model_path) : rem.error);
 
         std::unordered_set<std::string> routed_names;
         std::vector<std::regex> user_re;
@@ -1368,25 +1381,28 @@ bool Session::Impl::load_model(Opening & o, llama_model ** reference) {
     }
 
     llama_model * m = nullptr;
-    if (remote) {
-        const RemoteGgufMeta & rem = o.ensure_remote();
-        struct RemoteLoadState {
+    if (use_user_loader) {
+        const RemoteGgufMeta & rem = o.ensure_user_load();
+        struct UserLoadState {
             const GgufOffsets * offs = nullptr;
             BlockProvider * prov = nullptr;
             ggml_backend_buffer_type_t vhost_buft = nullptr;
+            bool remote = false;
             std::vector<uint8_t> bounce;
             bool failed = false;
             std::string error;
         };
-        RemoteLoadState rstate;
+        UserLoadState rstate;
         rstate.offs = &rem.meta.offsets;
         rstate.prov = rem.provider.get();
         rstate.vhost_buft = bmoe_virtual_host_buffer_type();
+        rstate.remote = remote;
 
         auto set_tensor_cb = [](ggml_tensor * t, void * vud) {
-            auto * st = static_cast<RemoteLoadState *>(vud);
+            auto * st = static_cast<UserLoadState *>(vud);
             if (!st || st->failed || !t) return;
-            // Skip virtual-host routed expert tensors: 0 HTTP bytes requested and 0 RAM committed.
+            // Skip virtual-host streamed tensors (routed experts & host-streamed dense weights):
+            // 0 bytes read from disk/HTTP and 0 physical RAM committed at boot.
             if (t->buffer && ggml_backend_buffer_get_type(t->buffer) == st->vhost_buft) return;
             const size_t total = ggml_nbytes(t);
             if (total == 0) return;
@@ -1395,7 +1411,7 @@ bool Session::Impl::load_model(Opening & o, llama_model ** reference) {
             auto it_file = st->offs->file_by_name.find(t->name);
             if (it_off == st->offs->off_by_name.end() || it_file == st->offs->file_by_name.end()) {
                 st->failed = true;
-                st->error = std::string("remote GGUF missing offset for tensor ") + t->name;
+                st->error = std::string("GGUF missing offset for tensor ") + t->name;
                 return;
             }
             const uint64_t base_off = it_off->second;
@@ -1408,17 +1424,20 @@ bool Session::Impl::load_model(Opening & o, llama_model ** reference) {
             }
             for (size_t done = 0; done < total;) {
                 const size_t n = std::min(k_chunk, total - done);
+                // BlockProvider::read() returns >= nbytes for O_DIRECT aligned windows (or < 0 on error).
                 if (host_direct) {
-                    if (st->prov->read(0, shard, static_cast<char *>(t->data) + done, base_off + done, n) !=
+                    if (st->prov->read(0, shard, static_cast<char *>(t->data) + done, base_off + done, n) <
                         (long long) n) {
                         st->failed = true;
-                        st->error = std::string("HTTP read failed while loading tensor ") + t->name;
+                        st->error = std::string(st->remote ? "HTTP" : "local") +
+                                    " read failed while loading tensor " + t->name;
                         return;
                     }
                 } else {
-                    if (st->prov->read(0, shard, st->bounce.data(), base_off + done, n) != (long long) n) {
+                    if (st->prov->read(0, shard, st->bounce.data(), base_off + done, n) < (long long) n) {
                         st->failed = true;
-                        st->error = std::string("HTTP read failed while loading tensor ") + t->name;
+                        st->error = std::string(st->remote ? "HTTP" : "local") +
+                                    " read failed while loading tensor " + t->name;
                         return;
                     }
                     ggml_backend_tensor_set(t, st->bounce.data(), done, n);
@@ -1427,12 +1446,68 @@ bool Session::Impl::load_model(Opening & o, llama_model ** reference) {
             }
         };
 
-        m = llama_model_init_from_user(rem.gguf_ctx.get(), set_tensor_cb, &rstate, mparams);
+        // When load_mtp is off and the file carries trailing MTP/nextn blocks, strip those unused
+        // tensor entries from the manifest handed to llama_model_init_from_user(): upstream
+        // llama_model_loader increments n_created on TENSOR_SKIP entries even when set_tensor_data
+        // is non-null (where expected n_tensors == 0), failing done_getting_tensors(). Re-parse the
+        // filtered metadata via gguf_init_from_buffer() so gguf_get_data_offset() > 0 (has_manifest
+        // == true) and llama_model_loader returns nullptr cleanly for absent TENSOR_NOT_REQUIRED
+        // entries instead of fabricating virtual F32 tensors.
+        gguf_context * user_gguf = rem.gguf_ctx.get();
+        std::unique_ptr<gguf_context, void (*)(gguf_context *)> filtered_gguf(nullptr, gguf_free);
+        if (!mparams.load_mtp && rem.meta.info.n_nextn > 0) {
+            const int n_layer_trunk = std::max(0, rem.meta.info.n_block - rem.meta.info.n_nextn);
+            const int64_t n_src_t = gguf_get_n_tensors(user_gguf);
+            gguf_context * fg = gguf_init_empty();
+            if (fg) {
+                gguf_set_kv(fg, user_gguf);
+                ggml_init_params gp = {
+                    /* .mem_size   = */ ggml_tensor_overhead() * (size_t) std::max<int64_t>(n_src_t, 1) + 4096,
+                    /* .mem_buffer = */ nullptr,
+                    /* .no_alloc   = */ true,
+                };
+                ggml_context * scratch = ggml_init(gp);
+                if (scratch) {
+                    for (int64_t i = 0; i < n_src_t; ++i) {
+                        const char * tname = gguf_get_tensor_name(user_gguf, i);
+                        if (!tname) continue;
+                        const int bl = tensor_names::block_layer(tname);
+                        if (tensor_names::is_mtp_tensor(tname) || bl >= n_layer_trunk) continue;
+                        const int64_t * ne = gguf_get_tensor_ne(user_gguf, i);
+                        const ggml_type ty = gguf_get_tensor_type(user_gguf, i);
+                        int nd = GGML_MAX_DIMS;
+                        while (nd > 1 && ne[nd - 1] == 1) --nd;
+                        ggml_tensor * dt = ggml_new_tensor(scratch, ty, nd, ne);
+                        ggml_set_name(dt, tname);
+                        gguf_add_tensor(fg, dt);
+                    }
+                    ggml_free(scratch);
+                    const size_t meta_sz = gguf_get_meta_size(fg);
+                    std::vector<uint8_t> meta_buf(meta_sz);
+                    gguf_get_meta_data(fg, meta_buf.data());
+                    gguf_free(fg);
+                    gguf_init_params gip = { /* .no_alloc = */ true, /* .ctx = */ nullptr };
+                    gguf_context * parsed = gguf_init_from_buffer(meta_buf.data(), meta_buf.size(), gip);
+                    if (parsed) {
+                        filtered_gguf.reset(parsed);
+                        user_gguf = parsed;
+                    }
+                } else {
+                    gguf_free(fg);
+                }
+            }
+        }
+
+        m = llama_model_init_from_user(user_gguf, set_tensor_cb, &rstate, mparams);
+        // For local files, release the single-lane boot provider immediately so ExpertStreamSource
+        // and DenseStreamSource open their own multi-lane providers sized to their exact read shapes.
+        // Remote HTTP keeps its pre-opened provider alive to reuse keep-alive sockets and spill cache.
+        if (!remote) o.remote.provider.reset();
         if (rstate.failed) {
             if (m) llama_model_free(m);
             return o.fail(rstate.error);
         }
-        if (!m) return o.fail("could not load remote model: " + cfg.model_path);
+        if (!m) return o.fail(std::string("could not load ") + (remote ? "remote " : "") + "model: " + cfg.model_path);
     } else {
         m = llama_model_load_from_file(cfg.model_path.c_str(), mparams);
         if (!m) return o.fail("could not load the model: " + cfg.model_path);
@@ -2397,27 +2472,15 @@ bool Session::Impl::bind_streaming(Opening & o) {
         // qualified or the takeover declined, and the hook then costs exactly nothing per node.
         hook->set_row_source(source.row_source());
     } else if (cfg.moe.dense_stream) {
-        // Pure dense model (or MoE with only --dense-stream): handle the tiny permanently resident
-        // weights (norms, biases) and optional --row-stream tables via standalone_dense, excluding
-        // streamed dense weight byte ranges so Warmed/sensor never touch streamed layers.
-        std::vector<std::vector<std::pair<uint64_t, uint64_t>>> excluded(offs.shard_paths.size());
-        for (const DenseTensorRef & d : streamed_dense) {
-            if (d.file_idx >= 0 && (size_t) d.file_idx < excluded.size())
-                excluded[(size_t) d.file_idx].push_back({d.file_off, d.file_off + d.size});
-        }
+        // Pure dense model (or MoE with only --dense-stream): load_model() booted via
+        // llama_model_init_from_user() with no mmap, so the tiny resident weights (norms, biases)
+        // are already in anonymous RAM; standalone_dense only needs to take over --row-stream tables.
         std::vector<std::vector<std::pair<uint64_t, uint64_t>>> dense_ranges(offs.shard_paths.size());
-        if (!is_remote_url(cfg.model_path)) {
-            for (size_t s = 0; s < offs.shard_paths.size(); ++s) {
-                pio::fd_t fd = pio::open_read(offs.shard_paths[s].c_str(), false);
-                const uint64_t fsz = pio::fd_ok(fd) ? pio::file_size(fd) : 0;
-                if (pio::fd_ok(fd)) pio::close_fd(fd);
-                dense_ranges[s] = DenseWeights::byte_ranges(std::move(excluded[s]), fsz);
-            }
-        }
         if (!row_tensors.empty()) standalone_dense.set_row_gathered(std::move(row_tensors), row_budget);
         if (!cfg.moe.dense_mapped.empty()) standalone_dense.set_mapped(cfg.moe.dense_mapped);
         if (!standalone_dense.init(cfg.moe.dense_weights, offs.shard_paths, std::move(dense_ranges),
-                                   std::move(resident_dense), cfg.moe.io_backend, http_options_from(cfg.moe)))
+                                   std::move(resident_dense), cfg.moe.io_backend, http_options_from(cfg.moe),
+                                   /*already_resident=*/true))
             return o.fail("resident dense weights init failed");
         hook->set_row_source(standalone_dense.row_source());
     }
@@ -2429,7 +2492,9 @@ bool Session::Impl::bind_streaming(Opening & o) {
         hook->set_dense_source(&dense_stream);
     }
 
-    if (!is_remote_url(cfg.model_path)) {
+    // Only release/drop file mappings when llama_model_load_from_file() actually created an mmap
+    // (remote HTTP and --dense-stream both boot via llama_model_init_from_user() with no mmap).
+    if (!is_remote_url(cfg.model_path) && !cfg.moe.dense_stream) {
         release_mapping(cfg, offs, unaccounted);
         // llama.cpp asks for the whole mapping to be read ahead at load (init_mappings prefetches every
         // non-lazy range), so the model files fill the system's page cache with bytes this run reads

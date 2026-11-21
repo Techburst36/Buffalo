@@ -76,7 +76,8 @@ public:
               std::vector<std::vector<std::pair<uint64_t, uint64_t>>> ranges,
               std::vector<DenseTensorRef> tensors,
               IoBackend io_backend = IoBackend::Auto,
-              const HttpProviderOptions & http_opt = {});
+              const HttpProviderOptions & http_opt = {},
+              bool already_resident = false);
 
     // Tables the graph only ever ROW-GATHERS (discovered by RouterHook, never named here): instead
     // of being made resident, they are bound to reserved address space and served from flash a row
@@ -147,6 +148,7 @@ private:
     IoBackend io_backend_ = IoBackend::Auto;
     HttpProviderOptions http_opt_;
     bool remote_ = false;
+    bool no_mmap_ = false; // true when loaded via llama_model_init_from_user (remote HTTP or local --dense-stream)
     std::vector<std::string> paths_; // one per shard, in shard order
 
     // Anonymous/Pinned: our own BlockProvider over all shards, the tensors we read, and the buffers
