@@ -496,6 +496,12 @@ struct Session::Impl {
     long long mtp_drafted = 0;
     long long mtp_accepted = 0;
     long long mtp_decodes = 0;
+    long long ngram_drafted_steps = 0;
+    long long ngram_drafted = 0;
+    long long ngram_accepted = 0;
+    long long model_drafted_steps = 0;
+    long long model_drafted = 0;
+    long long model_accepted = 0;
     long long model_catchup_tokens = 0;
     // Steps that drafted anything at all. Against mtp_decodes this is the n-gram source's match
     // rate — the fraction of the run where it had evidence and widened the verify batch. For the
@@ -3431,6 +3437,7 @@ struct Session::Impl::Turn {
     bool spec_on = false;
     bool mtp_on = false;
     bool draft_model_on = false;
+    bool hybrid_on = false;
     int prefill_device_tokens = 0;
     uint64_t arena_read0 = 0;
     uint64_t arena_cache0 = 0;
@@ -3456,6 +3463,8 @@ struct Session::Impl::Turn {
     std::vector<llama_token> verify_toks; // [confirmed token, drafts...] for the verify batch
     std::vector<llama_token> confirmed;   // what one decode confirmed, in order
     long long mtp0_drafted = 0, mtp0_accepted = 0, mtp0_decodes = 0, mtp0_drafted_steps = 0;
+    long long mtp0_ngram_steps = 0, mtp0_ngram_drafted = 0, mtp0_ngram_accepted = 0;
+    long long mtp0_model_steps = 0, mtp0_model_drafted = 0, mtp0_model_accepted = 0;
     long long mtp0_catchup = 0;
     double mtp0_draft_s = 0.0;
     uint64_t mtp0_draft_bytes = 0;
@@ -3887,6 +3896,7 @@ struct Session::Impl::Turn {
         spec_on = im.cfg.spec.enabled();
         mtp_on = im.mtp != nullptr;
         draft_model_on = im.draft_runner.active();
+        hybrid_on = im.cfg.spec.is_hybrid() && draft_model_on;
         if (tk.stream.has_media()) im.media_in_conversation = true;
         if (im.media_in_conversation && (spec_on || mtp_on || draft_model_on)) {
             if (!im.media_spec_logged) {
@@ -3898,6 +3908,7 @@ struct Session::Impl::Turn {
             spec_on = false;
             mtp_on = false;
             draft_model_on = false;
+            hybrid_on = false;
         }
         // With a prefill device the prompt goes in one ubatch per decode, so each graph's width is one
         // we chose and can place: wide pieces on the device, a narrow tail on the CPU. Left to
@@ -4072,6 +4083,12 @@ struct Session::Impl::Turn {
         mtp0_accepted = im.mtp_accepted;
         mtp0_decodes = im.mtp_decodes;
         mtp0_drafted_steps = im.drafted_steps;
+        mtp0_ngram_steps = im.ngram_drafted_steps;
+        mtp0_ngram_drafted = im.ngram_drafted;
+        mtp0_ngram_accepted = im.ngram_accepted;
+        mtp0_model_steps = im.model_drafted_steps;
+        mtp0_model_drafted = im.model_drafted;
+        mtp0_model_accepted = im.model_accepted;
         mtp0_catchup = im.model_catchup_tokens;
         mtp0_draft_s = im.mtp_draft_seconds;
         mtp0_draft_bytes = im.mtp_draft_read_bytes;
@@ -4156,6 +4173,24 @@ struct Session::Impl::Turn {
             if (!llama_memory_seq_rm(llama_get_memory(im.ctx_dft.get()), /*seq*/ 0, n_past, -1))
                 return fail(RunError::Failed, "the MTP draft context does not support rewinding its KV cache");
             s.sweep_source = s.n_draft > 0 ? "mtp" : "none";
+        } else if (hybrid_on) {
+            // Hybrid source: try n-gram lookup first at zero KV cost; only when it abstains does
+            // the resident draft model lazily catch up on accepted tokens in one batch and draft.
+            const int cap = std::min(im.cfg.spec.draft_max, room);
+            s.n_draft = ngram_draft(mtp_ctx, tok, cap, im.cfg.spec.ngram_min_match, im.cfg.spec.ngram_max_match,
+                                    im.draft_buf);
+            if (s.n_draft > 0) {
+                s.sweep_source = "ngram";
+            } else {
+                const detail::DraftStepResult dr =
+                    im.draft_runner.draft(mtp_ctx, tok, cap, im.cfg.spec.draft_tau, im.draft_buf);
+                if (!dr.ok) return fail(RunError::Failed, dr.error);
+                s.n_draft = dr.n_draft;
+                s.ran_draft_model = true;
+                s.catchup_tokens = dr.catchup_tokens;
+                im.model_catchup_tokens += dr.catchup_tokens;
+                s.sweep_source = s.n_draft > 0 ? "model" : "none";
+            }
         } else if (draft_model_on) {
             const detail::DraftStepResult dr =
                 im.draft_runner.draft(mtp_ctx, tok, std::min(im.cfg.spec.draft_max, room), im.cfg.spec.draft_tau,
@@ -4298,6 +4333,15 @@ struct Session::Impl::Turn {
             s.draft_s += secs(p0, clock_t_::now());
         }
         im.mtp_draft_seconds += s.draft_s;
+        if (std::strcmp(s.sweep_source, "ngram") == 0) {
+            ++im.ngram_drafted_steps;
+            im.ngram_drafted += s.n_draft;
+            im.ngram_accepted += s.n_acc;
+        } else if (std::strcmp(s.sweep_source, "model") == 0) {
+            ++im.model_drafted_steps;
+            im.model_drafted += s.n_draft;
+            im.model_accepted += s.n_acc;
+        }
         if (draft_model_on) {
             log_printf(LogLevel::Info,
                        "spec sweep %lld: source=%s draft=%d accepted=%d/%d confirmed=%d catchup=%d draft_ms=%.1f",
@@ -4604,6 +4648,12 @@ struct Session::Impl::Turn {
         s.mtp_accepted = im.mtp_accepted - mtp0_accepted;
         s.mtp_decodes = im.mtp_decodes - mtp0_decodes;
         s.drafted_steps = im.drafted_steps - mtp0_drafted_steps;
+        s.ngram_drafted_steps = im.ngram_drafted_steps - mtp0_ngram_steps;
+        s.ngram_drafted = im.ngram_drafted - mtp0_ngram_drafted;
+        s.ngram_accepted = im.ngram_accepted - mtp0_ngram_accepted;
+        s.model_drafted_steps = im.model_drafted_steps - mtp0_model_steps;
+        s.model_drafted = im.model_drafted - mtp0_model_drafted;
+        s.model_accepted = im.model_accepted - mtp0_model_accepted;
         s.model_catchup_tokens = im.model_catchup_tokens - mtp0_catchup;
         s.mtp_draft_s_per_token = n_gen > 0 ? (im.mtp_draft_seconds - mtp0_draft_s) / n_gen : 0.0;
         s.mtp_draft_read_mib = (double) (im.mtp_draft_read_bytes - mtp0_draft_bytes) / (1024.0 * 1024.0);

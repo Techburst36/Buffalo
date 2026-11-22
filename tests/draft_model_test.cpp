@@ -159,6 +159,183 @@ static void test_session_draft_model(const std::string & model_path) {
     }
 }
 
+// Gate 4: Hybrid lazy KV catch-up test.
+// Proves directly that tokens accepted during n-gram sweeps (while the draft model is NOT called)
+// are lazily prefilled into the draft model's KV cache in one batch right before its next draft,
+// yielding the exact same draft tokens and cumulative probability as a fresh full-prefix prefill.
+static void test_hybrid_lazy_catchup_direct(const std::string & model_path) {
+    llama_backend_init();
+
+    llama_model_params mp = llama_model_default_params();
+    mp.n_gpu_layers = 0;
+    ggml_backend_dev_t no_devs[1] = {nullptr};
+    mp.devices = no_devs;
+    std::unique_ptr<llama_model, void (*)(llama_model *)> model(llama_model_load_from_file(model_path.c_str(), mp),
+                                                                llama_model_free);
+    check(model != nullptr, "hybrid catch-up: loaded tiny model");
+    if (!model) {
+        llama_backend_free();
+        return;
+    }
+
+    const llama_vocab * vocab = llama_model_get_vocab(model.get());
+    const std::string text = "def merge_intervals(intervals): return sorted(intervals)";
+    std::vector<llama_token> toks(text.size() + 8);
+    int n_tok = llama_tokenize(vocab, text.c_str(), (int) text.size(), toks.data(), (int) toks.size(), true, true);
+    if (n_tok < 0) {
+        toks.resize((size_t) (-n_tok));
+        n_tok = llama_tokenize(vocab, text.c_str(), (int) text.size(), toks.data(), (int) toks.size(), true, true);
+    }
+    toks.resize((size_t) std::max(0, n_tok));
+    check(toks.size() >= 30, "hybrid catch-up: tokenized test sequence (" + std::to_string(toks.size()) + " tokens)");
+
+    llama_context_params cp = llama_context_default_params();
+    cp.n_ctx = 256;
+    cp.n_batch = 128;
+    cp.n_ubatch = 128;
+    cp.n_outputs_max = 1;
+    cp.type_k = GGML_TYPE_F16;
+    cp.type_v = GGML_TYPE_F16;
+    cp.swa_full = false;
+    std::unique_ptr<llama_context, void (*)(llama_context *)> ctx_lazy(llama_init_from_model(model.get(), cp),
+                                                                       llama_free);
+    std::unique_ptr<llama_context, void (*)(llama_context *)> ctx_ref(llama_init_from_model(model.get(), cp),
+                                                                      llama_free);
+    std::unique_ptr<llama_context, void (*)(llama_context *)> ctx_stale(llama_init_from_model(model.get(), cp),
+                                                                        llama_free);
+    check(ctx_lazy && ctx_ref && ctx_stale, "hybrid catch-up: created lazy, reference, and stale contexts");
+    if (!ctx_lazy || !ctx_ref || !ctx_stale) {
+        llama_backend_free();
+        return;
+    }
+
+    DraftModelRunner lazy, ref, stale;
+    lazy.init(ctx_lazy.get(), vocab, (int) llama_n_ubatch(ctx_lazy.get()));
+    ref.init(ctx_ref.get(), vocab, (int) llama_n_ubatch(ctx_ref.get()));
+    stale.init(ctx_stale.get(), vocab, (int) llama_n_ubatch(ctx_stale.get()));
+
+    // Step 1: initial draft on prefix[0..11] + tok[12], then partial accept of 2 drafts.
+    std::vector<llama_token> prefix1(toks.begin(), toks.begin() + 12);
+    const llama_token last1 = toks[12];
+    std::vector<llama_token> draft1;
+    const DraftStepResult r1 = lazy.draft(prefix1, last1, 6, 0.0f, draft1);
+    check(r1.ok && r1.n_draft == 6 && r1.catchup_tokens == 13,
+          "hybrid catch-up: initial draft prefilled prompt+last (catchup=" + std::to_string(r1.catchup_tokens) + ")");
+    // Target confirms last1 + 2 accepted drafts -> positions 0..14 confirmed, rejects drafts 2..5.
+    lazy.on_accept(/*n_past_before_verify*/ 12, /*n_accepted*/ 2);
+    check(lazy.kv_len() == 15,
+          "hybrid catch-up: on_accept trimmed rejected drafts cleanly (kv_len=" + std::to_string(lazy.kv_len()) + ")");
+
+    // Simulated n-gram sweeps: 10 additional tokens are accepted into the target's history WITHOUT
+    // touching the draft model's KV cache (lazy.kv_len() stays at 15).
+    std::vector<llama_token> prefix2 = prefix1;
+    prefix2.push_back(last1);
+    prefix2.push_back(draft1[0]);
+    prefix2.push_back(draft1[1]);
+    const int n_ngram_accepted = 10;
+    for (int i = 0; i < n_ngram_accepted; ++i)
+        prefix2.push_back(toks[(size_t) (15 + i)]);
+    const llama_token last2 = toks[25];
+    check(lazy.kv_len() == 15 && (int) prefix2.size() == 25,
+          "hybrid catch-up: draft KV stays untouched during n-gram sweeps (kv_len=15, prefix=25)");
+
+    // Step 2: n-gram abstains, so the draft model must catch up all 10 n-gram tokens + last2
+    // in one batch and produce logits and drafts identical to a fresh full-prefix prefill.
+    std::vector<llama_token> out_lazy, out_ref;
+    const DraftStepResult r_lazy = lazy.draft(prefix2, last2, 6, 0.0f, out_lazy);
+    const DraftStepResult r_ref = ref.draft(prefix2, last2, 6, 0.0f, out_ref);
+    check(r_lazy.ok && r_ref.ok, "hybrid catch-up: lazy and reference drafts succeeded");
+    check(r_lazy.catchup_tokens == n_ngram_accepted + 1,
+          "hybrid catch-up: prefilled exact n-gram gap + last token in one call (catchup=" +
+              std::to_string(r_lazy.catchup_tokens) + ", want " + std::to_string(n_ngram_accepted + 1) + ")");
+    check(lazy.kv_len() == r_ref.catchup_tokens + 5,
+          "hybrid catch-up: lazy KV length matches reference (" + std::to_string(lazy.kv_len()) + ")");
+    check(out_lazy == out_ref, "hybrid catch-up: lazy draft tokens match fresh full-prefix prefill exactly");
+
+    const int n_vocab = llama_vocab_n_tokens(vocab);
+    const float * lg_lazy = llama_get_logits_ith(ctx_lazy.get(), -1);
+    const float * lg_ref = llama_get_logits_ith(ctx_ref.get(), -1);
+    double max_diff_lazy_ref = 0.0;
+    for (int v = 0; v < n_vocab; ++v)
+        max_diff_lazy_ref = std::max(max_diff_lazy_ref, (double) std::fabs(lg_lazy[v] - lg_ref[v]));
+    check(max_diff_lazy_ref < 1e-4,
+          "hybrid catch-up: lazy logits match fresh full-prefix prefill (max_diff=" +
+              std::to_string(max_diff_lazy_ref) + ")");
+
+    // Control check: verify that omitting the 10 n-gram tokens produces measurably different logits
+    // (proves the caught-up n-gram tokens actually enter KV attention rather than being ignored).
+    std::vector<llama_token> short_prefix(prefix2.begin(), prefix2.begin() + 15);
+    std::vector<llama_token> out_stale;
+    const DraftStepResult r_stale = stale.draft(short_prefix, last2, 6, 0.0f, out_stale);
+    const float * lg_stale = llama_get_logits_ith(ctx_stale.get(), -1);
+    double max_diff_stale_ref = 0.0;
+    for (int v = 0; v < n_vocab; ++v)
+        max_diff_stale_ref = std::max(max_diff_stale_ref, (double) std::fabs(lg_stale[v] - lg_ref[v]));
+    check(r_stale.ok && max_diff_stale_ref > 1e-4,
+          "hybrid catch-up control: omitting n-gram tokens changes draft logits (max_diff=" +
+              std::to_string(max_diff_stale_ref) + ")");
+
+    lazy.reset();
+    ref.reset();
+    stale.reset();
+    ctx_lazy.reset();
+    ctx_ref.reset();
+    ctx_stale.reset();
+    model.reset();
+    llama_backend_free();
+}
+
+static void test_session_hybrid(const std::string & model_path) {
+    // Run base first on a repeating prompt so we know the exact output and guarantee both an
+    // n-gram match (from the prompt repetition) and n-gram abstentions (novel generated tail).
+    RunConfig base;
+    base.model_path = model_path;
+    base.prompt = "one two three four five six seven eight one two three four";
+    base.n_ctx = 256;
+    base.n_predict = 24;
+    base.n_threads = 2;
+    base.n_gpu_layers = 0;
+    base.device_use = DeviceUse::CpuOnly;
+
+    const RunResult r_base = run(base);
+    check(r_base.ok && r_base.summary.n_generated == 24, "hybrid session: base run succeeded");
+
+    // Prepend a snippet of base's own early output + repeated prefix so n-gram fires AND accepts
+    // tokens early, while later positions abstain and fall back to the draft model with lazy catch-up.
+    RunConfig hyb = base;
+    hyb.prompt = base.prompt + " " + r_base.generated_text.substr(0, 6) + " " + base.prompt;
+    const RunResult r_base2 = run([&] {
+        RunConfig c = base;
+        c.prompt = hyb.prompt;
+        return c;
+    }());
+    check(r_base2.ok && r_base2.summary.n_generated == 24, "hybrid session: base2 run succeeded");
+
+    hyb.spec.source = DraftSource::hybrid;
+    hyb.spec.draft_model = model_path;
+    hyb.spec.draft_max = 6;
+    hyb.spec.draft_tau = 0.0f;
+    hyb.spec.ngram_min_match = 2;
+    hyb.spec.ngram_max_match = 12;
+
+    const RunResult r_hyb = run(hyb);
+    check(r_hyb.ok, "hybrid session: hybrid run succeeded (" + r_hyb.error + ")");
+    check(r_hyb.generated_text == r_base2.generated_text, "hybrid session: output matches base exactly");
+    check(r_hyb.summary.ngram_drafted_steps > 0,
+          "hybrid session: n-gram drafted on at least one sweep (" + std::to_string(r_hyb.summary.ngram_drafted_steps) +
+              ")");
+    check(r_hyb.summary.model_drafted_steps > 0,
+          "hybrid session: draft model fell back on abstain (" + std::to_string(r_hyb.summary.model_drafted_steps) +
+              ")");
+    check(r_hyb.summary.model_catchup_tokens > 0,
+          "hybrid session: draft model lazily caught up tokens (" +
+              std::to_string(r_hyb.summary.model_catchup_tokens) + ")");
+    check(r_hyb.summary.mtp_drafted == r_hyb.summary.ngram_drafted + r_hyb.summary.model_drafted &&
+              r_hyb.summary.mtp_accepted == r_hyb.summary.ngram_accepted + r_hyb.summary.model_accepted &&
+              r_hyb.summary.drafted_steps == r_hyb.summary.ngram_drafted_steps + r_hyb.summary.model_drafted_steps,
+          "hybrid session: per-source counters sum cleanly to totals");
+}
+
 int main(int argc, char ** argv) {
     test_pure_policy();
 
@@ -167,6 +344,8 @@ int main(int argc, char ** argv) {
         const std::string other_vocab = argc >= 3 ? argv[2] : BMOE_QWEN35_VOCAB_PATH;
         test_tokenizer_parity(model_path, other_vocab);
         test_session_draft_model(model_path);
+        test_hybrid_lazy_catchup_direct(model_path);
+        test_session_hybrid(model_path);
     }
 
     if (failures) {

@@ -315,7 +315,14 @@ struct RunSummary {
     // completely different fixes. The route trace cannot see it: its framing brackets the target
     // decode, and the head only ever runs in the draft context.
     double mtp_draft_read_mib = 0.0;
-    // Standalone draft model tokens lazily prefilled into its KV cache across this turn.
+    // Per-source speculative breakdown (populated for ngram/model/hybrid) and standalone draft
+    // model tokens lazily prefilled into its KV cache across this turn.
+    long long ngram_drafted_steps = 0;
+    long long ngram_drafted = 0;
+    long long ngram_accepted = 0;
+    long long model_drafted_steps = 0;
+    long long model_drafted = 0;
+    long long model_accepted = 0;
     long long model_catchup_tokens = 0;
 
     // Expert-prediction accuracy (all zero unless MoeStreamConfig::predict_log). `predict_stale` is

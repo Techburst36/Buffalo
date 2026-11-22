@@ -456,13 +456,14 @@ struct MoeStreamConfig {
 // Where the draft tokens of a speculative step come from. The verify half of the loop is
 // identical for every source; only the producer differs, and with it what a draft costs.
 enum class DraftSource {
-    none,  // no speculation: one token per decode
-    mtp,   // the model's own trained multi-token-prediction head (needs the nextn block)
-    ngram, // prompt-lookup over prompt + generated tokens (needs nothing from the model)
-    model, // a standalone resident draft model (e.g. Llama-3.2-1B-Instruct) with its own KV cache
+    none,   // no speculation: one token per decode
+    mtp,    // the model's own trained multi-token-prediction head (needs the nextn block)
+    ngram,  // prompt-lookup over prompt + generated tokens (needs nothing from the model)
+    model,  // a standalone resident draft model (e.g. Llama-3.2-1B-Instruct) with its own KV cache
+    hybrid, // n-gram lookup first; falls back to standalone draft model with lazy KV catch-up
 };
 
-// Stable lowercase spelling ("off", "mtp", "ngram", "model"), shared by telemetry and CLI summary.
+// Stable lowercase spelling ("off", "mtp", "ngram", "model", "hybrid"), shared by telemetry and CLI summary.
 const char * draft_source_name(DraftSource s);
 
 // Self-speculative decoding: draft draft_max continuation tokens, then verify all of them in ONE
@@ -561,8 +562,9 @@ struct SpecConfig {
     bool is_mtp() const { return source == DraftSource::mtp; }
     bool is_ngram() const { return source == DraftSource::ngram; }
     bool is_model() const { return source == DraftSource::model; }
-    bool uses_draft_model() const { return source == DraftSource::model; }
-    bool uses_ngram() const { return source == DraftSource::ngram; }
+    bool is_hybrid() const { return source == DraftSource::hybrid; }
+    bool uses_draft_model() const { return source == DraftSource::model || source == DraftSource::hybrid; }
+    bool uses_ngram() const { return source == DraftSource::ngram || source == DraftSource::hybrid; }
 };
 
 // Prefill on an accelerator, decode on the CPU. Off unless `device` names a ggml device.

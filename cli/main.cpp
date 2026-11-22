@@ -1336,9 +1336,21 @@ int main(int argc, char ** argv) {
         std::printf("%s: drafting costs %.4f s/token on top of decode → %.2f tok/s effective "
                     "(vs %.2f reported)\n",
                     src, s.mtp_draft_s_per_token, eff, s.tokens_per_second);
-        // How often the source had anything to say. For the n-gram lookup and tau-gated draft model
-        // this is the share of sweeps that widened the verify batch vs plain single-token decodes.
-        if (cfg.spec.is_ngram() || cfg.spec.is_model()) {
+        // How often the source had anything to say. For the n-gram lookup, tau-gated draft model,
+        // and hybrid source this reports the share of sweeps that widened the verify batch (and
+        // which source produced them) vs plain single-token decodes.
+        if (cfg.spec.is_hybrid()) {
+            const double decs = s.mtp_decodes > 0 ? (double) s.mtp_decodes : 1.0;
+            const long long plain = s.mtp_decodes - s.drafted_steps;
+            std::printf("hybrid: drafted on %lld of %lld steps (%.1f%%) — "
+                        "ngram %lld (%.1f%%, %lld/%lld acc), "
+                        "model %lld (%.1f%%, %lld/%lld acc, %lld catchup toks), "
+                        "plain %lld (%.1f%%)\n",
+                        s.drafted_steps, s.mtp_decodes, 100.0 * (double) s.drafted_steps / decs, s.ngram_drafted_steps,
+                        100.0 * (double) s.ngram_drafted_steps / decs, s.ngram_accepted, s.ngram_drafted,
+                        s.model_drafted_steps, 100.0 * (double) s.model_drafted_steps / decs, s.model_accepted,
+                        s.model_drafted, s.model_catchup_tokens, plain, 100.0 * (double) plain / decs);
+        } else if (cfg.spec.is_ngram() || cfg.spec.is_model()) {
             std::printf("%s: drafted on %lld of %lld steps (%.1f%%); the rest decoded plainly\n", src, s.drafted_steps,
                         s.mtp_decodes, s.mtp_decodes > 0 ? 100.0 * (double) s.drafted_steps / s.mtp_decodes : 0.0);
         }

@@ -62,6 +62,8 @@ const char * draft_source_name(DraftSource s) {
         return "ngram";
     case DraftSource::model:
         return "model";
+    case DraftSource::hybrid:
+        return "hybrid";
     }
     return "off";
 }

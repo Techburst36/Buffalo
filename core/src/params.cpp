@@ -1213,19 +1213,21 @@ std::vector<ParamDesc> build() {
         ParamDesc d = row("spec", "Speculative drafts", G::Speculation, L::Advanced,
                           "Draft a continuation, then verify it in one wider decode. mtp uses the model's own "
                           "prediction head (needs the nextn block); ngram looks the recent tokens up in the "
-                          "prompt and the answer; model uses a small resident draft model (--draft-model). "
+                          "prompt and the answer; model uses a small resident draft model (--draft-model); "
+                          "hybrid tries ngram first and falls back to --draft-model with lazy KV catch-up. "
                           "Needs greedy decoding.");
         d.form = true;
         d.type = ParamType::Choice;
         d.flag.clear();
-        d.value_hint = "mtp|ngram|model";
-        d.switches = {{"--mtp", "mtp"}, {"--ngram", "ngram"}};
+        d.value_hint = "mtp|ngram|model|hybrid";
+        d.switches = {{"--mtp", "mtp"}, {"--ngram", "ngram"}, {"--hybrid", "hybrid"}};
         d.exclusive_switches = true;
         bind_choice<DraftSource>(d, [](RunConfig & c) -> DraftSource & { return c.spec.source; },
                                  {{DraftSource::none, {"none", "off"}},
                                   {DraftSource::mtp, {"mtp", "MTP head"}},
                                   {DraftSource::ngram, {"ngram", "n-gram lookup"}},
-                                  {DraftSource::model, {"model", "draft model"}}});
+                                  {DraftSource::model, {"model", "draft model"}},
+                                  {DraftSource::hybrid, {"hybrid", "n-gram + draft model"}}});
         d.details = "Guesses a few tokens ahead and checks them in one pass; the answer does not change. Needs "
                     "Temperature 0, and gains depend on the model.";
         t.push_back(d);
@@ -1241,13 +1243,19 @@ std::vector<ParamDesc> build() {
     {
         ParamDesc d = row("draft-model", "Draft model file", G::Speculation, L::Advanced,
                           "Path to a small resident GGUF draft model sharing the target's vocabulary (checked at "
-                          "load time). Passing this flag enables draft-model speculation.");
+                          "load time). Passing this flag alone enables draft-model speculation; combining it with "
+                          "--ngram or --hybrid enables hybrid n-gram + draft-model speculation.");
         d.type = ParamType::Path;
         d.value_hint = "PATH";
         d.get = [](const RunConfig & c) { return c.spec.draft_model; };
         d.set = [](RunConfig & c, const std::string & s, std::string &) {
             c.spec.draft_model = s;
-            if (!s.empty() && c.spec.source == DraftSource::none) c.spec.source = DraftSource::model;
+            if (!s.empty()) {
+                if (c.spec.source == DraftSource::none)
+                    c.spec.source = DraftSource::model;
+                else if (c.spec.source == DraftSource::ngram)
+                    c.spec.source = DraftSource::hybrid;
+            }
             return true;
         };
         t.push_back(d);
@@ -1778,7 +1786,11 @@ FlagResult apply_flag(RunConfig & cfg, const char * arg, const char * value) {
             r.param = &d;
             r.via_switch = &s;
             std::string err;
-            if (!d.set(cfg, s.value, err)) r.error = a + " " + err; // a table bug, caught by the tests
+            // Allow --draft-model PATH --ngram in either order on the CLI to select hybrid mode.
+            const bool upgrade_hybrid =
+                s.flag == "--ngram" && cfg.spec.source == DraftSource::model && !cfg.spec.draft_model.empty();
+            const std::string & target_val = upgrade_hybrid ? std::string("hybrid") : s.value;
+            if (!d.set(cfg, target_val, err)) r.error = a + " " + err; // a table bug, caught by the tests
             return r;
         }
     }

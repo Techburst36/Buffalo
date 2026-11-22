@@ -565,6 +565,22 @@ int main() {
         expect_fail("non-default draft_tau with n-gram source is rejected", c);
         c.spec.draft_tau = SpecConfig::draft_tau_default;
         expect_ok("n-gram source with default draft_tau stays valid", c);
+        // Hybrid source: combines n-gram + draft model rules.
+        c.spec.source = DraftSource::hybrid;
+        expect_fail("hybrid source without draft_model path is rejected", c);
+        c.spec.draft_model = "draft-1b.gguf";
+        c.spec.draft_max = 32;
+        c.spec.ngram_min_match = 2;
+        c.spec.draft_tau = 0.10f;
+        expect_ok("hybrid source with path, ngram_min_match and draft_tau is valid", c);
+        c.spec.ngram_min_match = 0;
+        expect_fail("hybrid source rejects invalid ngram_min_match", c);
+        c.spec.ngram_min_match = 2;
+        c.spec.draft_tau = -0.1f;
+        expect_fail("hybrid source rejects invalid draft_tau", c);
+        c.spec.draft_tau = 0.10f;
+        c.spec.draft_p_min = 0.4f;
+        expect_fail("hybrid source rejects MTP confidence floor", c);
     }
 
     // The verify batch must fit in one graph, or the amortisation it exists for is split away.

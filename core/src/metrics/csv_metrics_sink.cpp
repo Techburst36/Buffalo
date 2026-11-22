@@ -90,7 +90,9 @@ public:
                      "prefill_dev_tokens=%d prefill_dev_nodes=%lld prefill_dev_read_mib=%.1f prefill_dev_stall_s=%.3f "
                      "prefill_dev_cache_mib=%.1f "
                      "row_table_MiB=%.1f row_resident_MiB=%.1f row_rows=%lld row_reads=%lld "
-                     "row_read_MiB=%.1f row_evictions=%lld row_io_errors=%lld\n",
+                     "row_read_MiB=%.1f row_evictions=%lld row_io_errors=%lld "
+                     "ngram_steps=%lld ngram_drafted=%lld ngram_accepted=%lld "
+                     "model_steps=%lld model_drafted=%lld model_accepted=%lld model_catchup=%lld\n",
                      s.n_generated, s.s_per_token, s.tokens_per_second, s.moe_read_mib, s.moe_io_seconds,
                      s.moe_compute_s_per_token, s.moe_io_s_per_token, s.cache_hit_pct, s.n_prompt, s.load_seconds,
                      s.prefill_seconds, s.prefill_seconds > 0 ? s.n_prompt / s.prefill_seconds : 0.0,
@@ -108,7 +110,9 @@ public:
                      s.prefill_read_mib, s.prefill_io_seconds, s.prefill_stall_seconds, s.prefill_mgmt_seconds,
                      s.prefill_device_tokens, s.prefill_device_nodes, s.prefill_device_read_mib,
                      s.prefill_device_stall_seconds, s.prefill_device_cache_mib, s.row_table_mib, s.row_resident_mib,
-                     s.row_rows, s.row_slab_reads, s.row_read_mib, s.row_evictions, s.row_io_errors);
+                     s.row_rows, s.row_slab_reads, s.row_read_mib, s.row_evictions, s.row_io_errors,
+                     s.ngram_drafted_steps, s.ngram_drafted, s.ngram_accepted, s.model_drafted_steps, s.model_drafted,
+                     s.model_accepted, s.model_catchup_tokens);
         std::fflush(f_);
     }
 

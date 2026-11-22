@@ -199,6 +199,15 @@ int main() {
     expect_flag({"--draft", "5"}, [](const RunConfig & c) { return c.spec.draft_max == 5; });
     expect_flag({"--draft-model", "1b.gguf"},
                 [](const RunConfig & c) { return c.spec.source == DraftSource::model && c.spec.draft_model == "1b.gguf"; });
+    expect_flag({"--hybrid", "--draft-model", "1b.gguf"}, [](const RunConfig & c) {
+        return c.spec.source == DraftSource::hybrid && c.spec.draft_model == "1b.gguf";
+    });
+    expect_flag({"--ngram", "--draft-model", "1b.gguf"}, [](const RunConfig & c) {
+        return c.spec.source == DraftSource::hybrid && c.spec.draft_model == "1b.gguf";
+    });
+    expect_flag({"--draft-model", "1b.gguf", "--ngram"}, [](const RunConfig & c) {
+        return c.spec.source == DraftSource::hybrid && c.spec.draft_model == "1b.gguf";
+    });
     expect_flag({"--draft-tau", "0.25"}, [](const RunConfig & c) { return c.spec.draft_tau == 0.25f; });
     expect_flag({"--mtp-p-min", "0.6"}, [](const RunConfig & c) { return c.spec.draft_p_min == 0.6f; });
     expect_flag({"--ngram-min-match", "4"}, [](const RunConfig & c) { return c.spec.ngram_min_match == 4; });
@@ -343,6 +352,15 @@ int main() {
         c.spec.draft_max = 32;
         c.spec.draft_tau = 0.15f;
         expect_roundtrip("draft model speculation", c);
+    }
+    {
+        RunConfig c;
+        c.spec.source = DraftSource::hybrid;
+        c.spec.draft_model = "models/1b.gguf";
+        c.spec.draft_max = 32;
+        c.spec.draft_tau = 0.10f;
+        c.spec.ngram_min_match = 2;
+        expect_roundtrip("hybrid speculation", c);
     }
     {
         RunConfig c;
