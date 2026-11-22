@@ -600,8 +600,9 @@ struct PrefillDeviceConfig {
 
     // Narrowest prefill graph sent to the device. A prompt is fed in ubatch-wide pieces; pieces at
     // least this wide run on the device and a shorter tail runs on the CPU. It must exceed every
-    // graph width the CPU path uses, which is one token for plain decode — speculation's wider
-    // verify batch is excluded by validation for now.
+    // graph width the CPU path uses: one token for plain decode, and 1 + spec.draft_max when
+    // speculation is enabled (enforced by validate() and the planner's prefill_conflict(); with
+    // draft_max_limit = 64, callers combining --prefill-device with --draft >= 31 must raise this).
     int min_tokens = 32;
 
     // Loader threads of the streamed-expert arena (with moe.enabled). Separate from moe.io_threads,
