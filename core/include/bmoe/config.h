@@ -453,13 +453,17 @@ struct MoeStreamConfig {
     static constexpr float device_cache_cpu_share_max = 1.0f; // every miss on the host: the cache stops learning
 };
 
-// Where the draft tokens of a self-speculative step come from. The verify half of the loop is
-// identical for both sources; only the producer differs, and with it what a draft costs.
+// Where the draft tokens of a speculative step come from. The verify half of the loop is
+// identical for every source; only the producer differs, and with it what a draft costs.
 enum class DraftSource {
     none,  // no speculation: one token per decode
     mtp,   // the model's own trained multi-token-prediction head (needs the nextn block)
     ngram, // prompt-lookup over prompt + generated tokens (needs nothing from the model)
+    model, // a standalone resident draft model (e.g. Llama-3.2-1B-Instruct) with its own KV cache
 };
+
+// Stable lowercase spelling ("off", "mtp", "ngram", "model"), shared by telemetry and CLI summary.
+const char * draft_source_name(DraftSource s);
 
 // Self-speculative decoding: draft draft_max continuation tokens, then verify all of them in ONE
 // decode and accept the longest prefix whose argmax agrees with the draft. Nothing is approximated
@@ -532,6 +536,23 @@ struct SpecConfig {
     // making every step scan its full length for no additional selectivity.
     int ngram_max_match = 12;
 
+    // Standalone draft model (DraftSource::model). Path to a small resident GGUF with identical
+    // vocabulary/special tokens (verified at load time). Fully resident on GPU when available,
+    // with its own compact KV cache.
+    std::string draft_model;
+
+    // Standalone draft model cumulative confidence floor (tau). Greedily extend the draft while
+    // p1 * p2 * ... * pk stays >= draft_tau, up to draft_max. 0 disables early stopping.
+    static constexpr float draft_tau_default = 0.10f;
+    static constexpr float draft_tau_max = 1.0f;
+    float draft_tau = draft_tau_default;
+
+    // Default draft cap resolved by the CLI when --draft-model is passed without an explicit --draft.
+    static constexpr int draft_model_default_max = 32;
+    // Physical ubatch reserved for the standalone draft context: catch-up prefills chunk at this
+    // width and request 1 logit row, keeping the draft context's compute buffer small in VRAM.
+    static constexpr int draft_model_ubatch = 128;
+
     static constexpr int draft_max_limit = 64;
     static constexpr int ngram_match_limit = 64;
     static constexpr float draft_p_min_max = 1.0f; // a probability: only drafts the head is sure of
@@ -539,6 +560,9 @@ struct SpecConfig {
     bool enabled() const { return source != DraftSource::none; }
     bool is_mtp() const { return source == DraftSource::mtp; }
     bool is_ngram() const { return source == DraftSource::ngram; }
+    bool is_model() const { return source == DraftSource::model; }
+    bool uses_draft_model() const { return source == DraftSource::model; }
+    bool uses_ngram() const { return source == DraftSource::ngram; }
 };
 
 // Prefill on an accelerator, decode on the CPU. Off unless `device` names a ggml device.

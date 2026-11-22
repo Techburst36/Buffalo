@@ -10,6 +10,7 @@
 #include "chat_parse.h"
 #include "decide/decider.h"
 #include "decide/llama_backend.h"
+#include "draft_model.h"
 #include "logits.h"
 #include "prefill_support.h"
 #include "stop_text.h"
@@ -485,6 +486,8 @@ struct Session::Impl {
     std::unique_ptr<llama_model, void (*)(llama_model *)> model_dft{nullptr, llama_model_free};
     std::unique_ptr<llama_context, void (*)(llama_context *)> ctx_dft{nullptr, llama_free};
     common_speculative_ptr mtp;
+    // Standalone resident draft model runner (DraftSource::model). Uses ctx_dft with lazy KV sync.
+    detail::DraftModelRunner draft_runner;
     // Serves both roles on the speculative path, never both at once: a prefill chunk (up to
     // n_batch tokens, logits on the last) and a verify pass (1 + draft_max tokens, logits on all).
     llama_batch mtp_batch{};
@@ -493,6 +496,7 @@ struct Session::Impl {
     long long mtp_drafted = 0;
     long long mtp_accepted = 0;
     long long mtp_decodes = 0;
+    long long model_catchup_tokens = 0;
     // Steps that drafted anything at all. Against mtp_decodes this is the n-gram source's match
     // rate — the fraction of the run where it had evidence and widened the verify batch. For the
     // head it is all of them, since it drafts unconditionally unless p_min stops it.
@@ -555,7 +559,9 @@ struct Session::Impl {
     detail::ContextCheckpoints checkpoints;
     bool checkpoint_size_logged = false; // the size is the model's, so said once per session
     int checkpoint_turn = 0;             // which request took a checkpoint (ContextCheckpoints::create)
-    detail::CheckpointContexts checkpoint_contexts() { return {ctx.get(), ctx_dft.get(), mtp.get()}; }
+    detail::CheckpointContexts checkpoint_contexts() {
+        return {ctx.get(), cfg.spec.is_mtp() ? ctx_dft.get() : nullptr, mtp.get()};
+    }
     void forget_kv_tokens() {
         kv.clear();
         checkpoints.clear();
@@ -688,11 +694,13 @@ struct Session::Impl {
         // The speculative driver holds both contexts and detaches the backend samplers it
         // installed on the draft one, so it goes before either context is freed.
         mtp.reset();
+        draft_runner.reset();
         if (mtp_batch_owned) llama_batch_free(mtp_batch);
         if (media_batch_owned) llama_batch_free(media_batch);
         ctx_dft.reset();
         ctx.reset();
         hook.reset();
+        model_dft.reset();
         model.reset();
         expert_host_buf.reset();
         expert_host_registered.reset();
@@ -978,10 +986,11 @@ DecideResult Session::decide(const DecideRequest & req) {
     // context is overwritten, so forget it rather than let a later turn diff against stale tokens.
     im.chat_history.clear();
     im.forget_kv_tokens();
+    if (im.draft_runner.active()) im.draft_runner.reset_kv();
 
     detail::LlamaDecideDeps deps;
     deps.ctx = im.ctx.get();
-    deps.ctx_dft = im.ctx_dft.get();
+    deps.ctx_dft = im.cfg.spec.is_mtp() ? im.ctx_dft.get() : nullptr;
     deps.vocab = im.vocab;
     deps.n_vocab = im.n_vocab;
     deps.n_ctx = im.cfg.n_ctx;
@@ -1545,6 +1554,31 @@ bool Session::Impl::load_model(Opening & o, llama_model ** reference) {
         llama_model * h = llama_model_load_from_file(cfg.spec.mtp_head.c_str(), hp);
         if (!h) return o.fail("could not load {mtp-head}: " + cfg.spec.mtp_head);
         model_dft.reset(h);
+    } else if (cfg.spec.uses_draft_model()) {
+        // Standalone resident draft model: offload every layer to the GPU unless the caller forced
+        // CPU-only execution, respecting --device-list if specified.
+        llama_model_params dp = llama_model_default_params();
+        std::vector<ggml_backend_dev_t> draft_devs;
+        if (cfg.device_use == DeviceUse::CpuOnly) {
+            dp.devices = no_devices;
+            dp.n_gpu_layers = 0;
+        } else {
+            if (!cfg.device_list.empty()) {
+                for (const std::string & n : cfg.device_list) {
+                    if (ggml_backend_dev_t dev = ggml_backend_dev_by_name(n.c_str())) draft_devs.push_back(dev);
+                }
+                if (!draft_devs.empty()) {
+                    draft_devs.push_back(nullptr);
+                    dp.devices = draft_devs.data();
+                }
+            } else if (const ggml_backend_dev_t * devs = detail::PrefillPath::devices_without_prefill(draft_devs)) {
+                dp.devices = const_cast<ggml_backend_dev_t *>(devs);
+            }
+            dp.n_gpu_layers = llama_model_default_params().n_gpu_layers;
+        }
+        llama_model * dm = llama_model_load_from_file(cfg.spec.draft_model.c_str(), dp);
+        if (!dm) return o.fail("could not load {draft-model}: " + cfg.spec.draft_model);
+        model_dft.reset(dm);
     }
     return true;
 }
@@ -1601,9 +1635,14 @@ bool Session::Impl::read_model(Opening & o) {
     // trained MTP head — which is most ggufs, including quants of MTP-capable models that were
     // converted without the nextn tensors.
     n_layer_nextn = llama_model_n_layer_nextn(m);
-    if (model_dft && llama_model_n_layer_nextn(model_dft.get()) <= 0)
+    if (cfg.spec.is_mtp() && model_dft && llama_model_n_layer_nextn(model_dft.get()) <= 0)
         return o.fail("{mtp-head} names a file with no MTP head in it (its nextn_predict_layers is absent or zero): " +
                       cfg.spec.mtp_head);
+    if (cfg.spec.uses_draft_model()) {
+        const detail::TokenizerParity parity = detail::check_tokenizer_parity(m, model_dft.get());
+        if (!parity.ok) return o.fail(parity.error);
+        log_printf(LogLevel::Info, "draft model tokenizer parity ok: %s", parity.summary.c_str());
+    }
     if (cfg.spec.is_mtp() && !model_dft && n_layer_nextn <= 0)
         return o.fail("{spec=mtp} needs a model with a trained MTP head, and this model has none (no nextn block "
                       "in the file): give a head file in {mtp-head}, or use {spec=ngram}, which works with "
@@ -1904,6 +1943,32 @@ bool Session::Impl::create_contexts(Opening & o) {
         if (!d) return o.fail("failed to create the MTP draft context");
         ctx_dft.reset(d);
         llama_set_n_threads(d, cfg.n_threads, n_threads_batch);
+    } else if (cfg.spec.uses_draft_model()) {
+        // Standalone draft model context: compact compute/output buffers (n_ubatch <= 128,
+        // n_outputs_max = 1) so the resident drafter keeps minimal VRAM overhead beside the target.
+        llama_context_params dparams = llama_context_default_params();
+        dparams.n_ctx = (uint32_t) cfg.n_ctx;
+        const uint32_t d_ubatch =
+            std::min<uint32_t>(cparams.n_ubatch, (uint32_t) SpecConfig::draft_model_ubatch);
+        dparams.n_batch = d_ubatch;
+        dparams.n_ubatch = d_ubatch;
+        dparams.type_k = cparams.type_k;
+        dparams.type_v = cparams.type_v;
+        dparams.swa_full = false;
+        dparams.n_rs_seq = 0;
+        dparams.n_outputs_max = 1;
+        dparams.moe_cache_size = 0;
+        dparams.cb_eval = nullptr;
+        dparams.cb_eval_user_data = nullptr;
+        llama_context * d = llama_init_from_model(model_dft.get(), dparams);
+        if (!d && ggml_is_quantized(dparams.type_v)) {
+            dparams.type_v = GGML_TYPE_F16;
+            d = llama_init_from_model(model_dft.get(), dparams);
+        }
+        if (!d) return o.fail("failed to create the draft model context");
+        ctx_dft.reset(d);
+        llama_set_n_threads(d, cfg.n_threads, n_threads_batch);
+        draft_runner.init(d, llama_model_get_vocab(model_dft.get()), (int) llama_n_ubatch(d));
     }
     return true;
 }
@@ -2285,6 +2350,7 @@ bool Session::Impl::arm_device_cache(Opening & o) {
     // made again over the new ones.
     const bool had_mtp = mtp != nullptr;
     mtp.reset();
+    draft_runner.reset();
     ctx_dft.reset();
     if (hook) hook->clear_device_cache();
     source.set_device_cache_exclusive(false, 0);
@@ -2552,7 +2618,10 @@ bool Session::Impl::bind_streaming(Opening & o) {
     }
 
     clear_memory(ctx.get()); // discard warm-up KV
-    if (ctx_dft) llama_memory_clear(llama_get_memory(ctx_dft.get()), true);
+    if (draft_runner.active())
+        draft_runner.reset_kv();
+    else if (ctx_dft)
+        llama_memory_clear(llama_get_memory(ctx_dft.get()), true);
     return true;
 }
 
@@ -2724,10 +2793,11 @@ void Session::Impl::describe_run(Opening & o) {
         ri.cache_type_v = kv_cache_type_name(this->cfg.cache_type_v);
         ri.chatml = cfg.chatml;
         ri.compute_trace_layers = compute_trace && compute_trace->layers_only();
-        ri.spec = cfg.spec.is_mtp() ? "mtp" : cfg.spec.is_ngram() ? "ngram" : "off";
+        ri.spec = draft_source_name(cfg.spec.source);
         ri.spec_draft_max = cfg.spec.enabled() ? cfg.spec.draft_max : 0;
         ri.mtp_p_min = cfg.spec.is_mtp() ? cfg.spec.draft_p_min : 0.0f;
-        ri.ngram_min_match = cfg.spec.is_ngram() ? cfg.spec.ngram_min_match : 0;
+        ri.draft_tau = cfg.spec.uses_draft_model() ? cfg.spec.draft_tau : 0.0f;
+        ri.ngram_min_match = cfg.spec.uses_ngram() ? cfg.spec.ngram_min_match : 0;
         ri.temp = cfg.sampling.temp;
         ri.top_k = cfg.sampling.top_k;
         ri.top_p = cfg.sampling.top_p;
@@ -3300,7 +3370,10 @@ void Session::Impl::begin_generate(const GenerateRequest & req, IMetricsSink * s
         clear_memory(ctx.get());
         // The draft context tracks the target's positions and must be dropped with it, or the first
         // draft of the new conversation is conditioned on the previous one.
-        if (ctx_dft) llama_memory_clear(llama_get_memory(ctx_dft.get()), true);
+        if (draft_runner.active())
+            draft_runner.reset_kv();
+        else if (ctx_dft)
+            llama_memory_clear(llama_get_memory(ctx_dft.get()), true);
         chat_history.clear();
         forget_kv_tokens();
         // A new chat resets the sampler RNG, so a fixed seed reproduces the same transcript from a
@@ -3357,6 +3430,7 @@ struct Session::Impl::Turn {
     // context it never uses.
     bool spec_on = false;
     bool mtp_on = false;
+    bool draft_model_on = false;
     int prefill_device_tokens = 0;
     uint64_t arena_read0 = 0;
     uint64_t arena_cache0 = 0;
@@ -3382,6 +3456,7 @@ struct Session::Impl::Turn {
     std::vector<llama_token> verify_toks; // [confirmed token, drafts...] for the verify batch
     std::vector<llama_token> confirmed;   // what one decode confirmed, in order
     long long mtp0_drafted = 0, mtp0_accepted = 0, mtp0_decodes = 0, mtp0_drafted_steps = 0;
+    long long mtp0_catchup = 0;
     double mtp0_draft_s = 0.0;
     uint64_t mtp0_draft_bytes = 0;
     llama_token tok = 0;
@@ -3394,6 +3469,9 @@ struct Session::Impl::Turn {
         int n_draft = 0;
         double draft_s = 0.0; // this group's drafting + catch-up
         bool wide = false;
+        bool ran_draft_model = false;
+        int catchup_tokens = 0;
+        const char * sweep_source = "none";
         double overhead = 0.0; // everything since the previous decode returned
         clock_t_::time_point s0, s1;
         uint64_t f0 = 0, f1 = 0;
@@ -3718,7 +3796,9 @@ struct Session::Impl::Turn {
         // everything it generated. Miss this and the first prefill batch of the turn starts at a
         // position the draft context already has, which llama.cpp rejects outright: the second
         // message of a conversation fails while the first always works.
-        if (im.ctx_dft && !llama_memory_seq_rm(llama_get_memory(im.ctx_dft.get()), 0, im.kv.pos_at(n_common), -1))
+        if (im.draft_runner.active())
+            im.draft_runner.trim_kv((int) im.kv.pos_at(n_common));
+        else if (im.ctx_dft && !llama_memory_seq_rm(llama_get_memory(im.ctx_dft.get()), 0, im.kv.pos_at(n_common), -1))
             llama_memory_clear(llama_get_memory(im.ctx_dft.get()), true);
     }
 
@@ -3734,7 +3814,10 @@ struct Session::Impl::Turn {
         }
         // Whatever the target rolled back to, the draft context follows: a cancelled turn that left
         // the two at different positions would fail the NEXT turn, not this one.
-        if (im.ctx_dft) {
+        if (im.draft_runner.active()) {
+            const llama_pos keep = chat_on ? im.kv.pos_at(n_common) : 0;
+            im.draft_runner.trim_kv((int) keep);
+        } else if (im.ctx_dft) {
             const llama_pos keep = chat_on ? im.kv.pos_at(n_common) : 0;
             if (!llama_memory_seq_rm(llama_get_memory(im.ctx_dft.get()), 0, keep, -1)) {
                 llama_memory_clear(llama_get_memory(im.ctx_dft.get()), true);
@@ -3803,8 +3886,9 @@ struct Session::Impl::Turn {
         const auto t_prefill0 = clock_t_::now();
         spec_on = im.cfg.spec.enabled();
         mtp_on = im.mtp != nullptr;
+        draft_model_on = im.draft_runner.active();
         if (tk.stream.has_media()) im.media_in_conversation = true;
-        if (im.media_in_conversation && (spec_on || mtp_on)) {
+        if (im.media_in_conversation && (spec_on || mtp_on || draft_model_on)) {
             if (!im.media_spec_logged) {
                 im.media_spec_logged = true;
                 log_printf(LogLevel::Info, "speculation is off for a conversation holding an image: the draft "
@@ -3813,6 +3897,7 @@ struct Session::Impl::Turn {
             }
             spec_on = false;
             mtp_on = false;
+            draft_model_on = false;
         }
         // With a prefill device the prompt goes in one ubatch per decode, so each graph's width is one
         // we chose and can place: wide pieces on the device, a narrow tail on the CPU. Left to
@@ -3987,6 +4072,7 @@ struct Session::Impl::Turn {
         mtp0_accepted = im.mtp_accepted;
         mtp0_decodes = im.mtp_decodes;
         mtp0_drafted_steps = im.drafted_steps;
+        mtp0_catchup = im.model_catchup_tokens;
         mtp0_draft_s = im.mtp_draft_seconds;
         mtp0_draft_bytes = im.mtp_draft_read_bytes;
 
@@ -4069,6 +4155,17 @@ struct Session::Impl::Turn {
             // conditioned on the target's own hidden states instead of the head's guesses.
             if (!llama_memory_seq_rm(llama_get_memory(im.ctx_dft.get()), /*seq*/ 0, n_past, -1))
                 return fail(RunError::Failed, "the MTP draft context does not support rewinding its KV cache");
+            s.sweep_source = s.n_draft > 0 ? "mtp" : "none";
+        } else if (draft_model_on) {
+            const detail::DraftStepResult dr =
+                im.draft_runner.draft(mtp_ctx, tok, std::min(im.cfg.spec.draft_max, room), im.cfg.spec.draft_tau,
+                                      im.draft_buf);
+            if (!dr.ok) return fail(RunError::Failed, dr.error);
+            s.n_draft = dr.n_draft;
+            s.ran_draft_model = true;
+            s.catchup_tokens = dr.catchup_tokens;
+            im.model_catchup_tokens += dr.catchup_tokens;
+            s.sweep_source = s.n_draft > 0 ? "model" : "none";
         } else {
             // The n-gram source reads the text and nothing else: no draft context, no decode, no
             // expert read, so the bytes bracketed around this arm are zero by construction. When
@@ -4077,6 +4174,7 @@ struct Session::Impl::Turn {
             // floor of this source is the baseline rather than a loss.
             s.n_draft = ngram_draft(mtp_ctx, tok, std::min(im.cfg.spec.draft_max, room), im.cfg.spec.ngram_min_match,
                                     im.cfg.spec.ngram_max_match, im.draft_buf);
+            s.sweep_source = s.n_draft > 0 ? "ngram" : "none";
         }
         im.mtp_drafted += s.n_draft;
         if (s.n_draft > 0) ++im.drafted_steps;
@@ -4194,8 +4292,18 @@ struct Session::Impl::Turn {
                 return fail(RunError::Failed, "MTP draft context failed to process the verify batch");
             s.draft_s += secs(p0, clock_t_::now());
             if (moe.enabled) im.mtp_draft_read_bytes += im.source.stats().read_bytes - pb0;
+        } else if (s.ran_draft_model) {
+            const auto p0 = clock_t_::now();
+            im.draft_runner.on_accept((int) n_past, s.n_acc);
+            s.draft_s += secs(p0, clock_t_::now());
         }
         im.mtp_draft_seconds += s.draft_s;
+        if (draft_model_on) {
+            log_printf(LogLevel::Info,
+                       "spec sweep %lld: source=%s draft=%d accepted=%d/%d confirmed=%d catchup=%d draft_ms=%.1f",
+                       im.mtp_decodes - mtp0_decodes, s.sweep_source, s.n_draft, s.n_acc, s.n_draft, 1 + s.n_acc,
+                       s.catchup_tokens, s.draft_s * 1000.0);
+        }
 
         // Drop the rejected tail from the target; the bounded-rollback snapshots asked for at
         // context creation are what make this a restore rather than a replay. The draft context
@@ -4411,7 +4519,9 @@ struct Session::Impl::Turn {
         // The draft context mirrors the target's positions (process() decodes the same batches into
         // it), so it is trimmed to the same point — not cleared, or a continued chat turn would
         // feed it only the new suffix and draft from a state that never saw the conversation.
-        if (mtp_on && !llama_memory_seq_rm(llama_get_memory(im.ctx_dft.get()), 0, emitted_end, -1))
+        if (draft_model_on)
+            im.draft_runner.trim_kv((int) emitted_end);
+        else if (mtp_on && !llama_memory_seq_rm(llama_get_memory(im.ctx_dft.get()), 0, emitted_end, -1))
             llama_memory_clear(llama_get_memory(im.ctx_dft.get()), true);
     }
 
@@ -4494,6 +4604,7 @@ struct Session::Impl::Turn {
         s.mtp_accepted = im.mtp_accepted - mtp0_accepted;
         s.mtp_decodes = im.mtp_decodes - mtp0_decodes;
         s.drafted_steps = im.drafted_steps - mtp0_drafted_steps;
+        s.model_catchup_tokens = im.model_catchup_tokens - mtp0_catchup;
         s.mtp_draft_s_per_token = n_gen > 0 ? (im.mtp_draft_seconds - mtp0_draft_s) / n_gen : 0.0;
         s.mtp_draft_read_mib = (double) (im.mtp_draft_read_bytes - mtp0_draft_bytes) / (1024.0 * 1024.0);
         if (moe.predict_log) {

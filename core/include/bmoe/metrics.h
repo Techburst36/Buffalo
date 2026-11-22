@@ -315,6 +315,8 @@ struct RunSummary {
     // completely different fixes. The route trace cannot see it: its framing brackets the target
     // decode, and the head only ever runs in the draft context.
     double mtp_draft_read_mib = 0.0;
+    // Standalone draft model tokens lazily prefilled into its KV cache across this turn.
+    long long model_catchup_tokens = 0;
 
     // Expert-prediction accuracy (all zero unless MoeStreamConfig::predict_log). `predict_stale` is
     // the next layer's routing ranked a layer early, `predict_prev` the previous token's routing —
@@ -417,14 +419,15 @@ struct RunInfo {
     float top_p = 0.95f;
     uint32_t seed = 0xFFFFFFFFu;
 
-    // Self-speculation, and which source drafted ("off", "mtp", "ngram"). It changes how many tokens
-    // a decode confirms, so every per-token row in the file was produced under a different
+    // Self-speculation, and which source drafted ("off", "mtp", "ngram", "model"). It changes how
+    // many tokens a decode confirms, so every per-token row in the file was produced under a different
     // accounting than an unspeculated run — see TokenMetrics::mtp_batch. Recorded so the two are
     // never averaged together by accident, and so two speculated files are not compared across
     // sources without noticing.
     std::string spec = "off";
     int spec_draft_max = 0;
     float mtp_p_min = 0.0f;  // mtp: the head's confidence floor for drafting (0 = no floor)
+    float draft_tau = 0.0f;  // model: cumulative top-1 probability cutoff (0 = no floor)
     int ngram_min_match = 0; // ngram: shortest suffix match allowed to draft
 
     // Diagnostics that perturb what they measure. A traced run is not a benchmark run — recorded so

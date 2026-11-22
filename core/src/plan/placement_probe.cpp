@@ -139,6 +139,8 @@ Placement probe_placement(const char * model_path,
     // either way its state and compute buffers land on the devices beside the target's.
     const bool mtp = spec && spec->is_mtp();
     const bool own_head = mtp && !spec->mtp_head.empty();
+    const bool ext_draft = spec && spec->uses_draft_model() && !spec->draft_model.empty();
+    const bool has_extra = mtp || ext_draft;
     mparams.load_mtp = mtp && !own_head;
     llama_model_params dmparams = llama_model_default_params();
     llama_context_params dcparams = cparams;
@@ -156,11 +158,21 @@ Placement probe_placement(const char * model_path,
         draft.mparams = &dmparams;
         draft.cparams = &dcparams;
         draft.shares_model = !own_head;
+    } else if (ext_draft) {
+        dmparams.n_gpu_layers = llama_model_default_params().n_gpu_layers;
+        dcparams.moe_cache_size = 0;
+        dcparams.n_rs_seq = 0;
+        dcparams.n_outputs_max = 1;
+        dcparams.n_ubatch = std::min<uint32_t>(cparams.n_ubatch, (uint32_t) SpecConfig::draft_model_ubatch);
+        draft.path_model = spec->draft_model.c_str();
+        draft.mparams = &dmparams;
+        draft.cparams = &dcparams;
+        draft.shares_model = false;
     }
 
     const common_params_fit_status st =
         common_fit_params(model_path, &mparams, &cparams, tensor_split.data(), overrides.data(), margins.data(),
-                          fitter_n_ctx_min, mtp ? &draft : nullptr, GGML_LOG_LEVEL_WARN);
+                          fitter_n_ctx_min, has_extra ? &draft : nullptr, GGML_LOG_LEVEL_WARN);
     if (st == COMMON_PARAMS_FIT_STATUS_ERROR) {
         pl.outcome = "the capacity fitter hit an error; planning as if there were no devices";
         return pl;

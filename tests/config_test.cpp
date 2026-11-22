@@ -529,6 +529,44 @@ int main() {
         expect_ok("the confidence floor is valid for the source that has one", c);
     }
 
+    // Standalone resident draft model: requires a model path, validates draft_tau in [0, 1],
+    // rejects MTP-only knobs, and refuses draft_model / non-default draft_tau on other sources.
+    {
+        RunConfig c = ok_base();
+        c.spec.source = DraftSource::model;
+        expect_fail("draft model source without a path is rejected", c);
+        c.spec.draft_model = "draft-1b.gguf";
+        expect_ok("draft model source with path and default tau is valid", c);
+        c.spec.draft_max = 32;
+        expect_ok("draft model with draft_max=32 is valid", c);
+        c.spec.draft_tau = 0.0f;
+        expect_ok("draft_tau=0 (always draft full width) is valid", c);
+        c.spec.draft_tau = 1.0f;
+        expect_ok("draft_tau=1 is valid", c);
+        c.spec.draft_tau = -0.01f;
+        expect_fail("negative draft_tau is rejected", c);
+        c.spec.draft_tau = 1.01f;
+        expect_fail("draft_tau above 1 is rejected", c);
+        c.spec.draft_tau = std::numeric_limits<float>::quiet_NaN();
+        expect_fail("NaN draft_tau is rejected", c);
+        c.spec.draft_tau = SpecConfig::draft_tau_default;
+        c.spec.draft_p_min = 0.5f;
+        expect_fail("MTP confidence floor is rejected with draft model source", c);
+        c.spec.draft_p_min = 0.0f;
+        c.sampling.temp = 0.5f;
+        expect_fail("draft model source with sampling is rejected", c);
+        c.sampling.temp = 0.0f;
+        c.spec.source = DraftSource::mtp;
+        expect_fail("draft_model path with MTP source is rejected", c);
+        c.spec.source = DraftSource::ngram;
+        expect_fail("draft_model path with pure n-gram source is rejected", c);
+        c.spec.draft_model.clear();
+        c.spec.draft_tau = 0.25f;
+        expect_fail("non-default draft_tau with n-gram source is rejected", c);
+        c.spec.draft_tau = SpecConfig::draft_tau_default;
+        expect_ok("n-gram source with default draft_tau stays valid", c);
+    }
+
     // The verify batch must fit in one graph, or the amortisation it exists for is split away.
     {
         RunConfig c = ok_base();

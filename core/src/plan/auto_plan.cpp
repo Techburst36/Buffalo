@@ -38,7 +38,8 @@ const Placement & fitted_at(
     key.type_v = cfg.cache_type_v;
     if (cfg.spec.enabled())
         key.draft = std::to_string((int) cfg.spec.source) + "|" + std::to_string(cfg.spec.draft_max) + "|" +
-                    cfg.spec.mtp_head + "|" + std::to_string(cfg.spec.mtp_head_on_devices);
+                    cfg.spec.mtp_head + "|" + std::to_string(cfg.spec.mtp_head_on_devices) + "|" +
+                    cfg.spec.draft_model;
     auto at = facts.placement_at_width.find(key);
     if (at == facts.placement_at_width.end()) {
         at = facts.placement_at_width

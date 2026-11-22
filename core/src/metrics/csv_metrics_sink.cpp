@@ -49,9 +49,9 @@ public:
                      (double) r.substitute_lambda);
         std::fprintf(f_,
                      "# temp=%.4g top_k=%d top_p=%.4g seed=%u compute_trace_layers=%d spec=%s "
-                     "spec_draft_max=%d mtp_p_min=%.4g ngram_min_match=%d\n",
+                     "spec_draft_max=%d mtp_p_min=%.4g ngram_min_match=%d draft_tau=%.4g\n",
                      (double) r.temp, r.top_k, (double) r.top_p, r.seed, r.compute_trace_layers, r.spec.c_str(),
-                     r.spec_draft_max, (double) r.mtp_p_min, r.ngram_min_match);
+                     r.spec_draft_max, (double) r.mtp_p_min, r.ngram_min_match, (double) r.draft_tau);
         write_header();
     }
 

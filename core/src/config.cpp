@@ -52,6 +52,20 @@ const char * io_backend_name(IoBackend b) {
     return kIoBackends[0].name;
 }
 
+const char * draft_source_name(DraftSource s) {
+    switch (s) {
+    case DraftSource::none:
+        return "off";
+    case DraftSource::mtp:
+        return "mtp";
+    case DraftSource::ngram:
+        return "ngram";
+    case DraftSource::model:
+        return "model";
+    }
+    return "off";
+}
+
 const char * prefix_cache_mode_name(PrefixCacheMode m) {
     for (const auto & e : kPrefixCacheModes)
         if (e.mode == m) return e.name;
@@ -198,6 +212,10 @@ ValidationResult validate(const RunConfig & cfg) {
     // ignored: a caller who asked for both was promised something the engine cannot give.
     if (!cfg.spec.mtp_head.empty() && !cfg.spec.is_mtp())
         return fail("{mtp-head} is the head MTP drafts use: it needs {spec=mtp}");
+    if (cfg.spec.uses_draft_model() && cfg.spec.draft_model.empty())
+        return fail("{spec} needs a draft model file ({draft-model})");
+    if (!cfg.spec.draft_model.empty() && !cfg.spec.uses_draft_model())
+        return fail("{draft-model} is for standalone draft-model speculation and does not combine with {spec}");
     if (cfg.spec.enabled() && cfg.sampling.temp > 0.0f) {
         return fail("{spec} needs greedy decoding ({temp} at 0): a draft is checked against the single most likely "
                     "token, which is only the answer when nothing is sampled.");
@@ -214,18 +232,25 @@ ValidationResult validate(const RunConfig & cfg) {
     if (cfg.spec.is_mtp() && !(cfg.spec.draft_p_min >= 0.0f && cfg.spec.draft_p_min <= SpecConfig::draft_p_min_max)) {
         return fail("{mtp-p-min} must be between 0 and 1");
     }
-    // Both of these are source-specific knobs. Accepting one against the other source would silently
-    // do nothing, which is exactly the class of "the flag was ignored" bug this validation exists to
-    // prevent — the caller asked for a behaviour the chosen source does not have.
-    if (cfg.spec.is_ngram() && cfg.spec.draft_p_min != 0.0f) {
-        return fail("{mtp-p-min} is for MTP drafts (the head's own confidence in its proposal) and means nothing "
-                    "to n-gram drafts, which have no probabilities: their confidence gate is {ngram-min-match}.");
+    if (cfg.spec.uses_draft_model() &&
+        !(cfg.spec.draft_tau >= 0.0f && cfg.spec.draft_tau <= SpecConfig::draft_tau_max)) {
+        return fail("{draft-tau} must be between 0 and 1 (0 disables early confidence stopping)");
     }
-    if (cfg.spec.is_ngram() &&
+    // Source-specific knobs: accepting one against another source would silently do nothing, which
+    // is exactly the class of "the flag was ignored" bug this validation exists to prevent.
+    if (cfg.spec.enabled() && !cfg.spec.is_mtp() && cfg.spec.draft_p_min != 0.0f) {
+        return fail("{mtp-p-min} is for MTP drafts (the head's own confidence in its proposal): use "
+                    "{ngram-min-match} for n-gram drafts or {draft-tau} for a draft model.");
+    }
+    if (cfg.spec.enabled() && !cfg.spec.uses_draft_model() && cfg.spec.draft_tau != SpecConfig::draft_tau_default) {
+        return fail("{draft-tau} is the cumulative confidence floor for {draft-model} and means nothing to {spec}.");
+    }
+    if (cfg.spec.uses_ngram() &&
         (cfg.spec.ngram_max_match < 1 || cfg.spec.ngram_max_match > SpecConfig::ngram_match_limit)) {
         return fail("{ngram-max-match} must be between 1 and " + std::to_string(SpecConfig::ngram_match_limit));
     }
-    if (cfg.spec.is_ngram() && (cfg.spec.ngram_min_match < 1 || cfg.spec.ngram_min_match > cfg.spec.ngram_max_match)) {
+    if (cfg.spec.uses_ngram() &&
+        (cfg.spec.ngram_min_match < 1 || cfg.spec.ngram_min_match > cfg.spec.ngram_max_match)) {
         return fail("{ngram-min-match} must be between 1 and {ngram-max-match} (" +
                     std::to_string(cfg.spec.ngram_max_match) +
                     "): a floor above the longest run considered would never draft anything.");

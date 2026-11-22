@@ -197,6 +197,9 @@ int main() {
     expect_flag({"--mtp-head-on-devices"}, [](const RunConfig & c) { return c.spec.mtp_head_on_devices; });
     expect_flag({"--ngram"}, [](const RunConfig & c) { return c.spec.source == DraftSource::ngram; });
     expect_flag({"--draft", "5"}, [](const RunConfig & c) { return c.spec.draft_max == 5; });
+    expect_flag({"--draft-model", "1b.gguf"},
+                [](const RunConfig & c) { return c.spec.source == DraftSource::model && c.spec.draft_model == "1b.gguf"; });
+    expect_flag({"--draft-tau", "0.25"}, [](const RunConfig & c) { return c.spec.draft_tau == 0.25f; });
     expect_flag({"--mtp-p-min", "0.6"}, [](const RunConfig & c) { return c.spec.draft_p_min == 0.6f; });
     expect_flag({"--ngram-min-match", "4"}, [](const RunConfig & c) { return c.spec.ngram_min_match == 4; });
     expect_flag({"--ngram-max-match", "16"}, [](const RunConfig & c) { return c.spec.ngram_max_match == 16; });
@@ -332,6 +335,14 @@ int main() {
         c.moe.row_stream = true;
         c.moe.row_stream_mb = 16;
         expect_roundtrip("speculation + prefetch", c);
+    }
+    {
+        RunConfig c;
+        c.spec.source = DraftSource::model;
+        c.spec.draft_model = "models/1b.gguf";
+        c.spec.draft_max = 32;
+        c.spec.draft_tau = 0.15f;
+        expect_roundtrip("draft model speculation", c);
     }
     {
         RunConfig c;

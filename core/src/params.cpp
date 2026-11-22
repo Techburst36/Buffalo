@@ -1213,17 +1213,19 @@ std::vector<ParamDesc> build() {
         ParamDesc d = row("spec", "Speculative drafts", G::Speculation, L::Advanced,
                           "Draft a continuation, then verify it in one wider decode. mtp uses the model's own "
                           "prediction head (needs the nextn block); ngram looks the recent tokens up in the "
-                          "prompt and the answer. Needs greedy decoding.");
+                          "prompt and the answer; model uses a small resident draft model (--draft-model). "
+                          "Needs greedy decoding.");
         d.form = true;
         d.type = ParamType::Choice;
         d.flag.clear();
-        d.value_hint = "mtp|ngram";
+        d.value_hint = "mtp|ngram|model";
         d.switches = {{"--mtp", "mtp"}, {"--ngram", "ngram"}};
         d.exclusive_switches = true;
         bind_choice<DraftSource>(d, [](RunConfig & c) -> DraftSource & { return c.spec.source; },
                                  {{DraftSource::none, {"none", "off"}},
                                   {DraftSource::mtp, {"mtp", "MTP head"}},
-                                  {DraftSource::ngram, {"ngram", "n-gram lookup"}}});
+                                  {DraftSource::ngram, {"ngram", "n-gram lookup"}},
+                                  {DraftSource::model, {"model", "draft model"}}});
         d.details = "Guesses a few tokens ahead and checks them in one pass; the answer does not change. Needs "
                     "Temperature 0, and gains depend on the model.";
         t.push_back(d);
@@ -1234,6 +1236,31 @@ std::vector<ParamDesc> build() {
         bounds(d, 1, SpecConfig::draft_max_limit, "tokens");
         typical(d, usual::draft_lo, usual::draft_hi);
         bind_int(d, [](RunConfig & c) -> int & { return c.spec.draft_max; });
+        t.push_back(d);
+    }
+    {
+        ParamDesc d = row("draft-model", "Draft model file", G::Speculation, L::Advanced,
+                          "Path to a small resident GGUF draft model sharing the target's vocabulary (checked at "
+                          "load time). Passing this flag enables draft-model speculation.");
+        d.type = ParamType::Path;
+        d.value_hint = "PATH";
+        d.get = [](const RunConfig & c) { return c.spec.draft_model; };
+        d.set = [](RunConfig & c, const std::string & s, std::string &) {
+            c.spec.draft_model = s;
+            if (!s.empty() && c.spec.source == DraftSource::none) c.spec.source = DraftSource::model;
+            return true;
+        };
+        t.push_back(d);
+    }
+    {
+        ParamDesc d = row("draft-tau", "Draft cumulative confidence", G::Speculation, L::Advanced,
+                          "Draft model only: keep extending while the product of top-1 probabilities stays at "
+                          "least F (0 = always draft up to --draft).");
+        d.type = ParamType::Float;
+        d.value_hint = "F";
+        bounds(d, 0.0, SpecConfig::draft_tau_max);
+        special(d, "0", "always the full width");
+        bind_float(d, [](RunConfig & c) -> float & { return c.spec.draft_tau; });
         t.push_back(d);
     }
     {

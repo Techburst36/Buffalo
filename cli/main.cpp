@@ -945,6 +945,9 @@ int main(int argc, char ** argv) {
     // --cache-mb or BMOE_CACHE_MB still wins, including an explicit 0.
     if (cfg.moe.enabled && !cfg.moe.cache_auto && !seen.count("cache-mb") && std::getenv("BMOE_CACHE_MB") == nullptr)
         cfg.moe.cache_auto = true;
+    // Standalone draft model defaults to a cap of 32 tokens (cumulative tau stops earlier on
+    // uncertain stretches) unless the caller passed --draft explicitly.
+    if (cfg.spec.uses_draft_model() && !seen.count("draft")) cfg.spec.draft_max = SpecConfig::draft_model_default_max;
 
     // --auto: resolve the streaming knobs from what the machine and the model report. It runs after
     // the flags, the env overrides and the CLI's own defaults, so that anything the caller expressed
@@ -1320,7 +1323,7 @@ int main(int argc, char ** argv) {
     // Acceptance is the number that decides whether speculation can pay at all; tokens-per-decode is
     // what it actually bought, and it is what tok/s above is a function of.
     if (s.mtp_decodes > 0 && cfg.spec.enabled()) {
-        const char * src = cfg.spec.is_mtp() ? "mtp" : "ngram";
+        const char * src = draft_source_name(cfg.spec.source);
         std::printf("%s: %lld/%lld drafts accepted (%.1f%%), %.2f tokens per verify decode "
                     "(%lld decodes for %d tokens)\n",
                     src, s.mtp_accepted, s.mtp_drafted,
@@ -1333,11 +1336,10 @@ int main(int argc, char ** argv) {
         std::printf("%s: drafting costs %.4f s/token on top of decode → %.2f tok/s effective "
                     "(vs %.2f reported)\n",
                     src, s.mtp_draft_s_per_token, eff, s.tokens_per_second);
-        // How often the source had anything to say. For the n-gram lookup this is the whole shape of
-        // the result: the steps that did not draft ran at exactly the unspeculated cost, so a small
-        // delta over baseline means something quite different at 10% coverage than at 90%.
-        if (cfg.spec.is_ngram()) {
-            std::printf("ngram: drafted on %lld of %lld steps (%.1f%%); the rest decoded plainly\n", s.drafted_steps,
+        // How often the source had anything to say. For the n-gram lookup and tau-gated draft model
+        // this is the share of sweeps that widened the verify batch vs plain single-token decodes.
+        if (cfg.spec.is_ngram() || cfg.spec.is_model()) {
+            std::printf("%s: drafted on %lld of %lld steps (%.1f%%); the rest decoded plainly\n", src, s.drafted_steps,
                         s.mtp_decodes, s.mtp_decodes > 0 ? 100.0 * (double) s.drafted_steps / s.mtp_decodes : 0.0);
         }
         // Splits the run's flash bytes into the head's own routing and everything else, which is

@@ -366,6 +366,15 @@ if(PYTHON3)
                      "${CMAKE_CURRENT_BINARY_DIR}/tiny-moe-nemotron_h_moe.gguf")
     set_tests_properties(dense_stream PROPERTIES
                          FIXTURES_REQUIRED "TINY_MOE_MODEL_qwen3;TINY_MOE_MODEL_qwen3moe;TINY_MOE_MODEL_gemma4;TINY_MOE_MODEL_nemotron_h_moe")
+
+    add_executable(bmoe_draft_model_test draft_model_test.cpp)
+    target_link_libraries(bmoe_draft_model_test PRIVATE bmoe_core)
+    target_include_directories(bmoe_draft_model_test PRIVATE ${CMAKE_SOURCE_DIR}/core/src/engine)
+    target_compile_definitions(bmoe_draft_model_test PRIVATE
+        BMOE_QWEN35_VOCAB_PATH="${CMAKE_SOURCE_DIR}/third_party/llama.cpp/models/ggml-vocab-qwen35.gguf")
+    add_test(NAME draft_model
+             COMMAND bmoe_draft_model_test "${CMAKE_CURRENT_BINARY_DIR}/tiny-dense-qwen3.gguf")
+    set_tests_properties(draft_model PROPERTIES FIXTURES_REQUIRED TINY_MOE_MODEL_qwen3)
 else()
     message(WARNING "python3 not found: MoE gates will not run (models cannot be generated)")
 endif()
