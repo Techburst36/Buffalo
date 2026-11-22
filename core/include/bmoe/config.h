@@ -532,7 +532,7 @@ struct SpecConfig {
     // making every step scan its full length for no additional selectivity.
     int ngram_max_match = 12;
 
-    static constexpr int draft_max_limit = 8;
+    static constexpr int draft_max_limit = 64;
     static constexpr int ngram_match_limit = 64;
     static constexpr float draft_p_min_max = 1.0f; // a probability: only drafts the head is sure of
 
